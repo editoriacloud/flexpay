@@ -1,4 +1,4 @@
-# FlexPay (Daraja) — WHMCS M-Pesa Module Suite v3.0.0
+# FlexPay (Daraja) — WHMCS M-Pesa Module Suite
 
 A complete Safaricom Daraja (M-Pesa) integration for WHMCS: a payment
 gateway with intelligent, fully-automated C2B reconciliation, plus a
@@ -145,8 +145,7 @@ investigation from scratch.
 
 FlexPay is developed and licensed by **Editoria Cloud Systems**
 (https://www.editoriaweb.co.ke). Every copy of FlexPay checks in with
-Editoria Cloud Systems' own WHMCS installation — the licensing server
-URL is hardcoded into the module and is not a customer-editable setting.
+Editoria Cloud Systems' own WHMCS installation
 
 Customers only need to enter two values in their FlexPay gateway
 settings, both supplied at the time of purchase:
