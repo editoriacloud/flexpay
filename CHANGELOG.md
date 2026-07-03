@@ -1,1 +1,1 @@
-This Remains A secrete of our proffession
+This Remains A secret of our proffession
