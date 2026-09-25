@@ -33,6 +33,10 @@ class FlexPayDashboardActions
                 return self::reconcile($post, $adminUsername);
             case 'dismiss_unmatched':
                 return self::dismissUnmatched($post, $adminUsername);
+            case 'credit_client':
+                return self::creditClient($post, $adminUsername);
+            case 'admin_stk':
+                return self::adminStk($post, $adminUsername);
             case 'trigger_balance':
                 return self::triggerBalanceQuery($adminUsername);
             case 'trigger_status':
@@ -109,6 +113,36 @@ class FlexPayDashboardActions
         return FlexPayStore::dismissUnmatched($unmatchedId, $adminUsername, $reason);
     }
 
+    private static function creditClient(array $post, string $adminUsername): array
+    {
+        $unmatchedId = (int) ($post['unmatched_id'] ?? 0);
+        $clientId    = (int) ($post['client_id'] ?? 0);
+        if ($unmatchedId <= 0 || $clientId <= 0) {
+            return ['success' => false, 'message' => 'Choose a payment and enter a client ID.'];
+        }
+        return FlexPayStore::creditUnmatchedToClient($unmatchedId, $clientId, $adminUsername);
+    }
+
+    /** Admin sends an STK prompt for an invoice (from the admin invoice page panel). */
+    private static function adminStk(array $post, string $adminUsername): array
+    {
+        $invoiceId = (int) ($post['invoice_id'] ?? 0);
+        if (!($gw = self::gateway())) {
+            return self::inactive();
+        }
+        if (!FlexPayLicense::check($gw)['valid']) {
+            return ['success' => false, 'message' => 'The FlexPay license is not valid — payment prompts are disabled.'];
+        }
+        if (!FlexPaySecurity::rateLimit('admin_stk_inv_' . $invoiceId, 3, 300)) {
+            return ['success' => false, 'message' => 'Too many prompts for this invoice — wait a few minutes.'];
+        }
+
+        $result = FlexPayService::initiateStk($gw, $invoiceId, (string) ($post['phone'] ?? ''), $adminUsername);
+        return $result['success']
+            ? ['success' => true, 'message' => "M-Pesa prompt for KES " . number_format((float) $result['amount']) . " sent for Invoice #{$invoiceId}. The invoice updates automatically once the customer enters their PIN."]
+            : ['success' => false, 'message' => 'Prompt not sent: ' . $result['message']];
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // Daraja queries
     // ─────────────────────────────────────────────────────────────────────
@@ -128,22 +162,7 @@ class FlexPayDashboardActions
     /** Shared with the cron hook's optional daily balance snapshot. */
     public static function requestBalance(array $gw, array $initiator, string $actor): array
     {
-        $systemUrl = self::systemUrl($gw);
-        $response  = DarajaClient::fromGatewayParams($gw)->accountBalance([
-            'initiatorName'      => $initiator['name'],
-            'securityCredential' => $initiator['credential'],
-            'partyA'             => DarajaClient::c2bShortcode($gw),
-            'identifierType'     => '4',
-            'resultUrl'          => FlexPaySecurity::callbackUrl($systemUrl, 'balance_result'),
-            'timeoutUrl'         => FlexPaySecurity::callbackUrl($systemUrl, 'balance_timeout'),
-        ]);
-
-        $success = DarajaClient::isAccepted($response);
-        FlexPayStore::logApiCall('balance_query', ['shortcode' => DarajaClient::c2bShortcode($gw)], $response, $success, $actor);
-
-        return $success
-            ? ['success' => true, 'message' => 'Balance query sent. Refresh the Balance tab in 10–30 seconds for the result.']
-            : ['success' => false, 'message' => 'Balance request failed: ' . DarajaClient::errorMessage($response)];
+        return FlexPayService::requestBalance($gw, $initiator, $actor);
     }
 
     private static function triggerStatusQuery(array $post, string $adminUsername): array

@@ -25,7 +25,7 @@
  *
  * @package   FlexPay\Gateway
  * @author    Editoria Cloud Systems <https://www.editoriaweb.co.ke>
- * @version   3.5.0
+ * @version   3.6.0
  * @link      https://developers.whmcs.com/payment-gateways/
  * @link      https://developer.safaricom.co.ke/
  */
@@ -144,18 +144,23 @@ function flexpay_config()
             'Type'         => 'dropdown',
             'Options'      => 'strict,lenient',
             'Default'      => 'lenient',
-            'Description'  => 'strict = reject paybill payments whose account number does not match an open invoice. lenient = accept all, reconcile later in the dashboard. (External validation must be enabled on your shortcode by Safaricom.)',
+            'Description'  => 'strict = Safaricom rejects paybill payments whose account number is not exactly an open invoice (the customer sees the error on their phone). lenient = accept all; non-matching payments wait in Reconciliation. Either way, only exact references are ever applied. (External validation must be enabled on your shortcode by Safaricom.)',
         ],
-        'c2bPhoneMatching' => [
-            'FriendlyName' => 'Match C2B by Payer Phone',
+        'acceptBareInvoiceNumber' => [
+            'FriendlyName' => 'Accept Bare Invoice Number',
             'Type'         => 'yesno',
             'Default'      => 'on',
-            'Description'  => 'Apply a payment with no usable reference when the payer\'s phone matches exactly one client with an open invoice for that amount (ideal for Till payments).',
+            'Description'  => 'Also accept the plain invoice number (e.g. 42) as the account reference, in addition to INV-42 and the WHMCS invoice number. Payments are ONLY applied automatically when the reference is exactly one open invoice — never by amount or phone.',
         ],
-        'c2bAmountOnlyMatching' => [
-            'FriendlyName' => 'Match C2B by Amount Only',
-            'Type'         => 'yesno',
-            'Description'  => 'Also apply reference-less payments when the amount matches exactly one open invoice. Riskier — can credit the wrong customer if an unrelated payment shares the amount. Off by default.',
+        'selfVerifyMode' => [
+            'FriendlyName' => 'Customer Self-Verify',
+            'Type'         => 'dropdown',
+            'Options'      => [
+                'queue' => 'Queue for staff approval (recommended)',
+                'apply' => 'Apply automatically',
+            ],
+            'Default'      => 'queue',
+            'Description'  => 'When a customer submits the receipt of a payment made with a wrong/missing reference on the invoice page: queue it in Reconciliation with the invoice pre-filled, or apply it immediately.',
         ],
 
         // ── B2C / initiator ───────────────────────────────────────────
@@ -244,6 +249,120 @@ function flexpay_config()
             'Description'  => 'The MD5 Hash Verification / Secret Key for the FlexPay licensed product. Provided with your purchase.',
         ],
     ];
+}
+
+/**
+ * Validate settings when an admin saves the gateway configuration
+ * (WHMCS calls {module}_config_validate and shows the exception message).
+ * Catches the mistakes that otherwise only surface as failed payments.
+ */
+function flexpay_config_validate(array $params)
+{
+    $errors = [];
+
+    foreach (['businessShortcode' => 'Business Shortcode', 'stkPartyB' => 'Till Number', 'c2bShortcode' => 'C2B Shortcode', 'b2cShortcode' => 'B2C Shortcode'] as $key => $label) {
+        $value = trim((string) ($params[$key] ?? ''));
+        if ($value !== '' && !preg_match('/^\d{5,8}$/', $value)) {
+            $errors[] = "{$label} must be 5–8 digits.";
+        }
+    }
+
+    $prefix = trim((string) ($params['accountRefPrefix'] ?? ''));
+    if ($prefix !== '' && !preg_match('/^[A-Za-z][A-Za-z0-9]{0,5}$/', $prefix)) {
+        $errors[] = 'Account Reference Prefix must start with a letter and be at most 6 letters/digits (M-Pesa account references are limited to 12 characters).';
+    }
+
+    if (trim((string) ($params['consumerKey'] ?? '')) !== '' && trim((string) ($params['consumerSecret'] ?? '')) === '') {
+        $errors[] = 'Consumer Secret is required when a Consumer Key is set.';
+    }
+    if (trim((string) ($params['businessShortcode'] ?? '')) !== '' && trim((string) ($params['passkey'] ?? '')) === '') {
+        $errors[] = 'Lipa Na M-Pesa Passkey is required for STK Push.';
+    }
+
+    foreach (['trustedProxies' => 'Trusted Proxies', 'extraCallbackIps' => 'Extra Callback IPs'] as $key => $label) {
+        foreach (FlexPaySecurity::parseList((string) ($params[$key] ?? '')) as $entry) {
+            [$ip, $bits] = array_pad(explode('/', $entry, 2), 2, null);
+            $valid = filter_var($ip, FILTER_VALIDATE_IP) !== false
+                && ($bits === null || (ctype_digit($bits) && (int) $bits <= (strpos($ip, ':') !== false ? 128 : 32)));
+            if (!$valid) {
+                $errors[] = "{$label}: \"{$entry}\" is not a valid IP address or CIDR range.";
+            }
+        }
+    }
+
+    if (trim((string) ($params['b2cSecurityCredential'] ?? '')) === '' && trim((string) ($params['initiatorPassword'] ?? '')) !== ''
+        && DarajaClient::securityCredentialFromPassword((string) $params['initiatorPassword'], (string) ($params['initiatorCertificate'] ?? '')) === null) {
+        $errors[] = 'Could not encrypt the Initiator Password with the pasted Safaricom certificate — paste the full PEM certificate, or enter the Security Credential instead.';
+    }
+
+    if (($params['callbackSecurity'] ?? '') === 'off' && ($params['testMode'] ?? '') !== 'on') {
+        $errors[] = 'Callback Security cannot be Off in live mode — anyone could post fake payment notifications.';
+    }
+
+    if ($errors) {
+        $message = implode(' ', $errors);
+        if (class_exists('\WHMCS\Exception\Module\InvalidConfiguration')) {
+            throw new \WHMCS\Exception\Module\InvalidConfiguration($message);
+        }
+        throw new \Exception($message);
+    }
+}
+
+/**
+ * WHMCS 8.2+: show the M-Pesa account balance in WHMCS's own gateway
+ * balance display. Daraja's balance API is asynchronous, so this returns
+ * the latest snapshot and (at most every 30 minutes) requests a fresh one.
+ */
+function flexpay_account_balance(array $params = [])
+{
+    $shortcode = DarajaClient::c2bShortcode($params);
+    $latest    = FlexPayStore::getLatestBalance($shortcode);
+
+    $initiator = DarajaClient::initiatorCredentials($params);
+    if ($initiator !== null && (!$latest || strtotime((string) $latest->created_at) < time() - 1800)
+        && FlexPaySecurity::rateLimit('native_balance_refresh', 1, 1800)) {
+        FlexPayService::requestBalance($params, $initiator, 'whmcs_balance_widget');
+    }
+
+    $items = [
+        \WHMCS\Module\Gateway\Balance::factory($latest ? (float) $latest->working_account : 0.0, 'KES'),
+    ];
+    if ($latest) {
+        $items[] = \WHMCS\Module\Gateway\Balance::factory((float) $latest->utility_account, 'KES', 'status.pending', '#6ecacc');
+    }
+
+    return \WHMCS\Module\Gateway\BalanceCollection::factoryFromItems(...$items);
+}
+
+/**
+ * WHMCS 8.2+: details shown when an admin clicks a FlexPay transaction ID
+ * under Billing → Transactions. Served from FlexPay's own ledger (no Daraja
+ * call needed; the receipt or STK checkout ID is the WHMCS transaction ID).
+ */
+function flexpay_TransactionInformation(array $params = [])
+{
+    $transId = (string) ($params['transactionId'] ?? '');
+    $row     = FlexPayStore::findTransactionByReceipt($transId) ?: FlexPayStore::findTransactionByCheckoutId($transId);
+
+    $info = (new \WHMCS\Billing\Payment\Transaction\Information())->setTransactionId($transId);
+    if (!$row) {
+        return $info->setDescription('No FlexPay record found for this transaction ID.');
+    }
+
+    $labels = ['stk' => 'M-Pesa STK Push', 'c2b' => 'M-Pesa Paybill/Till (C2B)', 'b2c' => 'M-Pesa Refund (B2C)', 'reversal' => 'M-Pesa Reversal'];
+    $phone  = preg_match('/^[a-f0-9]{64}$/i', (string) $row->phone) ? '(hashed)' : DarajaClient::toDisplayPhone((string) $row->phone);
+
+    $info->setAmount((float) $row->amount)
+        ->setCurrency('KES')
+        ->setType($labels[$row->channel] ?? $row->channel)
+        ->setStatus(ucfirst((string) $row->status))
+        ->setDescription(trim(($row->account_reference ? 'Ref ' . $row->account_reference . ' · ' : '') . 'Phone ' . $phone . ' · ' . $row->result_desc));
+
+    if (class_exists('\WHMCS\Carbon') && $row->created_at) {
+        $info->setCreated(\WHMCS\Carbon::parse((string) $row->created_at));
+    }
+
+    return $info;
 }
 
 /** Account reference for an invoice ("INV-42"). */
@@ -355,7 +474,7 @@ function flexpay_link($params)
             Go to M-Pesa menu → Lipa na M-Pesa → Buy Goods and Services.<br>
             Till Number: <strong><?php echo $e($payNumber); ?></strong><br>
             Amount: <strong>KES <?php echo number_format($amount); ?></strong><br>
-            <span style="color:#007229;">Pay from the phone number on your account and this page will update itself automatically. If it doesn't within a minute, use "Already paid?" below.</span>
+            <span style="color:#b36b00;">Till payments made from the M-Pesa menu can't carry your invoice number, so they are confirmed by our team before your invoice updates. For instant confirmation use "Send M-Pesa Prompt" above. Already paid? Enter your receipt below.</span>
           </p>
           <?php else: ?>
           <p style="margin:8px 0 0;">
@@ -363,7 +482,7 @@ function flexpay_link($params)
             Business No: <strong><?php echo $e($payNumber); ?></strong><br>
             Account No: <strong><?php echo $e($accRef); ?></strong><br>
             Amount: <strong>KES <?php echo number_format($amount); ?></strong><br>
-            <span style="color:#007229;">This page will update itself automatically the moment we receive your payment — no need to reload.</span>
+            <span style="color:#007229;">Enter the Account No <strong>exactly</strong> as shown. This page updates itself automatically the moment we receive your payment. Payments with a different account number are not applied automatically.</span>
           </p>
           <?php endif; ?>
         </details>

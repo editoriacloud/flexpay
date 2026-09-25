@@ -9,7 +9,7 @@
  * WHMCS invoice — so the rules for doing that safely live in one place.
  *
  * @package FlexPay\Daraja
- * @version 3.5.0
+ * @version 3.6.0
  */
 
 if (!defined('WHMCS')) {
@@ -651,7 +651,13 @@ class FlexPayStore
             return $fail('whmcs_unavailable', 'WHMCS invoice functions could not be loaded.');
         }
 
-        $amount = self::kesToInvoiceCurrency($invoiceId, $kesAmount);
+        $amount = round(self::kesToInvoiceCurrency($invoiceId, $kesAmount), 2);
+
+        // WHMCS treats an amount of 0/'' as "pay the FULL balance". Never let
+        // a tiny payment that rounds to 0.00 after conversion get there.
+        if ($amount < 0.01) {
+            return $fail('invalid_amount', 'Payment converts to less than 0.01 in the invoice currency — not applied.');
+        }
 
         try {
             addInvoicePayment($invoiceId, $transId, $amount, 0, self::GATEWAY);
@@ -776,6 +782,23 @@ class FlexPayStore
             return ['applied' => false, 'already_settled' => false, 'invoice_id' => null, 'message' => 'No request on file for this checkout ID.'];
         }
 
+        if ($receipt) {
+            $holder = self::findTransactionByReceipt($receipt);
+            if ($holder && (int) $holder->id !== (int) $row->id) {
+                if (!self::absorbDuplicateReceipt($holder, $checkoutId)) {
+                    // The receipt was already credited through another path
+                    // (e.g. a C2B confirmation with the exact reference).
+                    if ($row->status !== 'success') {
+                        Capsule::table('flexpay_transactions')->where('id', $row->id)->whereIn('status', ['pending', 'failed'])->update([
+                            'status' => 'success', 'result_code' => '0', 'updated_at' => self::now(),
+                            'result_desc' => substr('Paid — already credited via receipt ' . $receipt . '.', 0, 255),
+                        ]);
+                    }
+                    return ['applied' => false, 'already_settled' => true, 'invoice_id' => $holder->invoice_id ? (int) $holder->invoice_id : null, 'message' => 'Already credited via receipt ' . $receipt . '.'];
+                }
+            }
+        }
+
         if ($row->status === 'success') {
             if ($receipt) {
                 self::attachReceiptToStk($row, $receipt);
@@ -824,8 +847,11 @@ class FlexPayStore
             self::logApiCall('stk_amount_mismatch', ['checkout_request_id' => $checkoutId], ['requested' => $amount, 'reported' => $reportedAmount], false, $source);
         }
 
+        // Rigid: an STK push carries OUR reference for its invoice, but if
+        // that invoice was meanwhile paid/cancelled the money is queued for
+        // a human instead of silently becoming client credit.
         $apply = $invoiceId
-            ? self::applyPaymentToInvoice($invoiceId, $transId, $amount)
+            ? self::applyPaymentToInvoice($invoiceId, $transId, $amount, self::OPEN_INVOICE_STATUSES)
             : ['applied' => false, 'reason' => 'no_invoice', 'message' => 'No invoice linked to this request.', 'outcome' => null];
 
         $desc = $apply['applied']
@@ -870,6 +896,32 @@ class FlexPayStore
     }
 
     /**
+     * A receipt we're about to record on an STK row already sits on another
+     * row. If that row is an UNAPPLIED C2B confirmation (the Till echo of
+     * this very STK payment, which arrived first and was queued), remove it
+     * and its Reconciliation entry so the payment exists once. Returns false
+     * if the other row was already applied — the caller must not credit again.
+     */
+    private static function absorbDuplicateReceipt(object $holder, string $checkoutId): bool
+    {
+        if ($holder->channel !== 'c2b' || !empty($holder->invoice_id) || $holder->direction !== 'in') {
+            return false;
+        }
+        try {
+            Capsule::table('flexpay_transactions')->where('id', $holder->id)->whereNull('invoice_id')->delete();
+            Capsule::table('flexpay_unmatched_payments')->where('trans_id', $holder->mpesa_receipt)->where('matched', 0)->update([
+                'matched'    => 1,
+                'matched_by' => 'system (duplicate of STK)',
+                'notes'      => substr('Same payment as STK request ' . $checkoutId . ' — recorded there.', 0, 255),
+                'matched_at' => self::now(),
+            ]);
+            return true;
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
+    /**
      * When an STK payment was settled before its receipt was known (using the
      * CheckoutRequestID as the WHMCS transaction ID), record the real receipt
      * on our row and on the WHMCS ledger entry so refunds and searches work.
@@ -877,6 +929,10 @@ class FlexPayStore
     public static function attachReceiptToStk(object $row, string $receipt): void
     {
         if (!empty($row->mpesa_receipt) || $receipt === '') {
+            return;
+        }
+        $holder = self::findTransactionByReceipt($receipt);
+        if ($holder && (int) $holder->id !== (int) $row->id && !self::absorbDuplicateReceipt($holder, (string) $row->checkout_request_id)) {
             return;
         }
         try {
@@ -918,9 +974,11 @@ class FlexPayStore
      * paybill/till. Find the STK push a C2B confirmation belongs to, so the
      * money is applied once (with the real receipt), not twice.
      *
-     * Matches a recent STK row for the same amount that is still pending, or
-     * was settled before its receipt was known, whose account reference or
-     * phone matches the C2B payload.
+     * RIGID: when the C2B carries an account reference it must equal the
+     * STK push's own AccountReference exactly (Safaricom echoes it for
+     * paybill STK). Only a reference-less C2B (Till echo) may be linked by
+     * payer phone + amount. A manual paybill payment typed with a different
+     * reference is never attached to someone's pending STK push.
      */
     public static function findStkForC2B(float $amount, string $billRef, string $msisdn, int $windowSeconds = 900): ?object
     {
@@ -940,11 +998,13 @@ class FlexPayStore
             return null;
         }
 
-        $billRef = strtoupper(trim($billRef));
+        $ref = self::normalizeReference($billRef);
         foreach ($rows as $row) {
-            $refMatch   = $billRef !== '' && strtoupper((string) $row->account_reference) === $billRef;
-            $phoneMatch = $msisdn !== '' && self::phoneMatches((string) $row->phone, $msisdn);
-            if ($refMatch || $phoneMatch) {
+            if ($ref !== '') {
+                if ($ref === self::normalizeReference((string) $row->account_reference)) {
+                    return $row;
+                }
+            } elseif ($msisdn !== '' && self::phoneMatches((string) $row->phone, $msisdn)) {
                 return $row;
             }
         }
@@ -1007,38 +1067,116 @@ class FlexPayStore
     // ─────────────────────────────────────────────────────────────────────
 
     /**
-     * Extract an invoice number from a customer-typed account reference:
-     *   "INV-42", "INV42", "inv 42", "42", "0000042", "INV-42-A" → 42
-     *
-     * Deliberately refuses to guess when the reference contains several
-     * unrelated numbers without the configured prefix ("ACC 2 PLAN 7"), or a
-     * number too long to be an invoice ID (a phone number, say).
+     * Normalise an account reference for comparison: upper-case, with the
+     * separators customers commonly type (spaces, "-", "_", "#", ".", "/",
+     * ":") removed. "inv - 0042" → "INV0042".
      */
-    public static function parseInvoiceRef(string $ref, string $prefix = 'INV'): ?int
+    public static function normalizeReference(string $ref): string
     {
-        $ref = trim($ref);
-        if ($ref === '') {
+        return strtoupper(preg_replace('/[\s\-_#.\/:]+/', '', trim($ref)));
+    }
+
+    /**
+     * RIGID parse of an account reference into an invoice ID.
+     *
+     * Only these shapes are accepted — the whole reference must be the
+     * invoice number, with nothing else in it:
+     *   "{PREFIX}-42", "{prefix}42", "{PREFIX} 0042", "#42"  → 42
+     *   "42", "0042"                                        → 42   (only if $allowBare)
+     * Anything else — extra words or numbers ("INV-42-A", "INV 23 and 24",
+     * "ACC 2 PLAN 7"), a phone number, an empty reference — returns null.
+     * (Before v3.6 any run of digits anywhere in the reference was used,
+     * which could credit the wrong invoice.)
+     */
+    public static function parseInvoiceRef(string $ref, string $prefix = 'INV', bool $allowBare = true): ?int
+    {
+        $norm   = self::normalizeReference($ref);
+        $prefix = self::normalizeReference($prefix);
+
+        if ($norm === '') {
             return null;
         }
 
-        $prefix = trim($prefix);
-        if ($prefix !== '' && preg_match('/' . preg_quote($prefix, '/') . '[\s\-_#:.\/]*0*(\d{1,10})/i', $ref, $m)) {
-            $num = (int) $m[1];
-            return $num > 0 ? $num : null;
-        }
-
-        if (preg_match_all('/\d+/', $ref, $m) && count($m[0]) === 1) {
+        $digits = null;
+        if ($prefix !== '' && strncmp($norm, $prefix, strlen($prefix)) === 0 && ctype_digit(substr($norm, strlen($prefix)))) {
+            $digits = substr($norm, strlen($prefix));
+        } elseif ($allowBare && ctype_digit($norm)) {
             // A phone number typed as the account number is not an invoice ID.
-            if (strlen($m[0][0]) >= 9 && DarajaClient::formatPhone($m[0][0]) !== '') {
+            if (strlen($norm) >= 9 && DarajaClient::formatPhone($norm) !== '') {
                 return null;
             }
-            $digits = ltrim($m[0][0], '0');
-            if ($digits !== '' && strlen($digits) <= 9) {
-                return (int) $digits;
+            $digits = $norm;
+        }
+
+        if ($digits === null || $digits === '') {
+            return null;
+        }
+        $digits = ltrim($digits, '0');
+        if ($digits === '' || strlen($digits) > 10) {
+            return null;
+        }
+
+        return (int) $digits;
+    }
+
+    /**
+     * Resolve an account reference to exactly one WHMCS invoice.
+     *
+     * Candidates: the invoice ID parsed by parseInvoiceRef(), and any invoice
+     * whose WHMCS invoice number (tblinvoices.invoicenum — used when Custom /
+     * Sequential Invoice Numbering is on, and printed on invoice emails)
+     * equals the normalised reference. If the two point at different
+     * invoices the reference is AMBIGUOUS and nothing is applied.
+     *
+     * @return array{invoice: ?object, reason: string, candidate: ?int}
+     *   reason: matched | no_reference | unrecognised | not_found | ambiguous | not_open
+     */
+    public static function resolveInvoiceReference(string $ref, array $gw): array
+    {
+        $norm = self::normalizeReference($ref);
+        if ($norm === '' || preg_match('/^0+$/', $norm)) {
+            return ['invoice' => null, 'reason' => 'no_reference', 'candidate' => null];
+        }
+
+        $ids = [];
+
+        $parsed = self::parseInvoiceRef($ref, (string) ($gw['accountRefPrefix'] ?? 'INV'), ($gw['acceptBareInvoiceNumber'] ?? 'on') === 'on');
+        if ($parsed !== null && self::getInvoice($parsed)) {
+            $ids[$parsed] = true;
+        }
+
+        // Match WHMCS's own invoice number exactly (normalised both sides).
+        if (strlen($norm) <= 60) {
+            try {
+                $query = Capsule::table('tblinvoices')->where('invoicenum', '!=', '');
+                $raw   = trim($ref);
+                $query->where(function ($q) use ($raw, $norm) {
+                    $q->where('invoicenum', $raw)->orWhere('invoicenum', $norm);
+                });
+                foreach ($query->take(5)->pluck('id') as $id) {
+                    $ids[(int) $id] = true;
+                }
+            } catch (\Throwable $e) {
+                // column missing on very old WHMCS — ID matching still works
             }
         }
 
-        return null;
+        if (count($ids) === 0) {
+            return ['invoice' => null, 'reason' => $parsed !== null ? 'not_found' : 'unrecognised', 'candidate' => null];
+        }
+        if (count($ids) > 1) {
+            return ['invoice' => null, 'reason' => 'ambiguous', 'candidate' => null];
+        }
+
+        $invoice = self::getInvoice((int) array_key_first($ids));
+        if (!$invoice) {
+            return ['invoice' => null, 'reason' => 'not_found', 'candidate' => null];
+        }
+        if (!in_array($invoice->status, self::OPEN_INVOICE_STATUSES, true)) {
+            return ['invoice' => null, 'reason' => 'not_open', 'candidate' => (int) $invoice->id];
+        }
+
+        return ['invoice' => $invoice, 'reason' => 'matched', 'candidate' => (int) $invoice->id];
     }
 
     /**
@@ -1129,66 +1267,59 @@ class FlexPayStore
     }
 
     /**
-     * Decide which invoice (if any) a C2B payment belongs to.
+     * Decide which invoice (if any) a C2B payment belongs to — RIGIDLY.
      *
-     * 1. Account reference → invoice number (paybill payments).
-     * 2. Payer's phone matches exactly one open invoice for this amount
-     *    (works for Till payments, which carry no reference).
-     * 3. Optional: amount matches exactly one open invoice (disambiguated by
-     *    due date); off by default since v3.5 because it can credit the wrong
-     *    customer when an unrelated payment happens to share an amount.
+     * A payment is auto-applied ONLY when its account reference resolves to
+     * exactly one open invoice (see resolveInvoiceReference()). A payment
+     * whose reference is missing, different, ambiguous, or points at a
+     * paid/cancelled invoice is NEVER applied automatically — whatever its
+     * amount or payer phone — and goes to the Reconciliation queue.
      *
-     * Never guesses on ambiguity; unresolved payments go to Reconciliation.
+     * Before v3.6, payments with a non-matching reference could still be
+     * applied when the payer's phone or the amount matched an open invoice,
+     * which marked invoices paid by unrelated payments of the same amount.
+     * Phone/amount now only produce a *suggestion* for the human reconciler.
      *
      * @return array ['invoice_id' => ?int, 'method' => string, 'note' => string, 'suggested' => ?int]
      */
     public static function matchC2BInvoice(float $amountKes, string $billRef, string $msisdn, string $transTime, array $gw): array
     {
-        $none = ['invoice_id' => null, 'method' => 'none', 'note' => '', 'suggested' => null];
+        $billRef  = trim($billRef);
+        $resolved = self::resolveInvoiceReference($billRef, $gw);
 
-        $billRef = trim($billRef);
-        $billRefUsable = $billRef !== '' && !preg_match('/^0+$/', $billRef);
-
-        if ($billRefUsable) {
-            $parsed = self::parseInvoiceRef($billRef, (string) ($gw['accountRefPrefix'] ?? 'INV'));
-            if ($parsed !== null) {
-                $invoice = self::getInvoice($parsed);
-                if ($invoice && in_array($invoice->status, self::OPEN_INVOICE_STATUSES, true)) {
-                    return ['invoice_id' => $parsed, 'method' => 'account_reference', 'note' => '', 'suggested' => null];
-                }
-                if ($invoice) {
-                    $none['note']      = "Reference points to Invoice #{$parsed}, which is {$invoice->status}.";
-                    $none['suggested'] = $parsed;
-                } else {
-                    $none['note'] = "Reference \"{$billRef}\" does not match any invoice.";
-                }
-            }
+        if ($resolved['reason'] === 'matched') {
+            return ['invoice_id' => (int) $resolved['invoice']->id, 'method' => 'account_reference', 'note' => '', 'suggested' => null];
         }
 
-        $open = null;
+        $notes = [
+            'no_reference' => 'No account reference (typical of Till/Buy Goods payments) — not applied automatically.',
+            'unrecognised' => "Reference \"{$billRef}\" is not an invoice number — not applied automatically.",
+            'not_found'    => "Reference \"{$billRef}\" looks like an invoice number but no such invoice exists.",
+            'ambiguous'    => "Reference \"{$billRef}\" matches more than one invoice (ID and invoice number) — not applied automatically.",
+            'not_open'     => "Reference \"{$billRef}\" is Invoice #{$resolved['candidate']}, which is not awaiting payment.",
+        ];
+        $note      = $notes[$resolved['reason']] ?? 'Not applied automatically.';
+        $suggested = $resolved['candidate'];
 
-        if (($gw['c2bPhoneMatching'] ?? 'on') === 'on' && $msisdn !== '') {
+        // Suggestions only — never applied without a human.
+        if ($suggested === null) {
             $open = self::listOpenInvoicesWithBalance();
-            $hits = array_values(array_filter($open, function ($inv) use ($amountKes, $msisdn) {
+            $byPhone = $msisdn === '' ? [] : array_values(array_filter($open, function ($inv) use ($amountKes, $msisdn) {
                 return abs($inv['balance_kes'] - $amountKes) < 1.0 && self::phoneMatches($inv['phone'], $msisdn);
             }));
-            if (count($hits) === 1) {
-                return ['invoice_id' => $hits[0]['id'], 'method' => 'phone_amount', 'note' => '', 'suggested' => null];
-            }
-            if (count($hits) > 1) {
-                $none['note'] = trim($none['note'] . ' Payer has ' . count($hits) . ' open invoices for this amount.');
-            }
-        }
-
-        if (($gw['c2bAmountOnlyMatching'] ?? '') === 'on' && (!$billRefUsable || ($gw['transactionType'] ?? '') === 'CustomerBuyGoodsOnline')) {
-            $open = $open ?? self::listOpenInvoicesWithBalance();
-            $candidate = self::pickUniqueAmountMatch($open, $amountKes, $transTime);
-            if ($candidate !== null) {
-                return ['invoice_id' => $candidate, 'method' => 'amount_timestamp', 'note' => '', 'suggested' => null];
+            if (count($byPhone) === 1) {
+                $suggested = $byPhone[0]['id'];
+                $note .= " Suggestion: the payer's phone and the amount match open Invoice #{$suggested}.";
+            } else {
+                $byAmount = self::pickUniqueAmountMatch($open, $amountKes, $transTime);
+                if ($byAmount !== null) {
+                    $suggested = $byAmount;
+                    $note .= " Suggestion: the amount matches open Invoice #{$suggested} (amount only — verify before applying).";
+                }
             }
         }
 
-        return $none;
+        return ['invoice_id' => null, 'method' => 'none', 'note' => $note, 'suggested' => $suggested];
     }
 
     /**
@@ -1349,6 +1480,14 @@ class FlexPayStore
                     return ['success' => true, 'applied' => false, 'already' => true, 'message' => 'This payment has already been applied to this invoice. If the page hasn\'t updated yet, refresh it.'];
                 }
 
+                if (!self::selfVerifyApplies()) {
+                    self::flagForInvoice($local, $invoiceId, 'Customer on Invoice #' . $invoiceId . ' submitted this receipt via "Verify your payment".');
+                    return [
+                        'success' => true, 'applied' => false, 'pending' => true,
+                        'message' => 'Thank you — we found your payment. It was made with a different account reference, so our team will confirm it and apply it to this invoice shortly.',
+                    ];
+                }
+
                 $result = self::applyOrphanedTransaction($local, $invoiceId, 'customer_self_verify');
                 return [
                     'success' => $result['success'], 'applied' => $result['success'],
@@ -1408,6 +1547,40 @@ class FlexPayStore
             ];
         } catch (\Throwable $e) {
             return ['success' => false, 'applied' => false, 'message' => $notFound];
+        }
+    }
+
+    /**
+     * Does customer self-verification apply payments itself ("apply"), or
+     * only flag them for staff approval ("queue", the rigid default)?
+     */
+    public static function selfVerifyApplies(?array $gw = null): bool
+    {
+        $gw = $gw ?? self::getFlexPayGatewayParams();
+        return ($gw['selfVerifyMode'] ?? 'queue') === 'apply';
+    }
+
+    /** Point an unapplied payment's Reconciliation entry at an invoice (suggestion only). */
+    public static function flagForInvoice(object $transaction, int $invoiceId, string $note): void
+    {
+        $transId = (string) $transaction->mpesa_receipt;
+        try {
+            $entry = Capsule::table('flexpay_unmatched_payments')->where('trans_id', $transId)->first();
+            if (!$entry) {
+                self::storeUnmatched([
+                    'trans_id' => $transId, 'amount' => (float) $transaction->amount, 'phone' => (string) $transaction->phone,
+                    'bill_ref' => (string) $transaction->account_reference, 'notes' => $note, 'suggested_invoice_id' => $invoiceId,
+                ]);
+                return;
+            }
+            if (!$entry->matched) {
+                Capsule::table('flexpay_unmatched_payments')->where('id', $entry->id)->update([
+                    'suggested_invoice_id' => $invoiceId,
+                    'notes'                => substr(trim($note . ' ' . (string) $entry->notes), 0, 255),
+                ]);
+            }
+        } catch (\Throwable $e) {
+            self::activity('flagForInvoice failed — ' . $e->getMessage());
         }
     }
 
@@ -1598,6 +1771,94 @@ class FlexPayStore
             return ['success' => true, 'message' => $apply['message'], 'outcome' => $apply['outcome']];
         } catch (\Throwable $e) {
             return ['success' => false, 'message' => 'Reconciliation failed: ' . $e->getMessage()];
+        }
+    }
+
+    /**
+     * Admin: record an unmatched payment as CREDIT on a client's account
+     * (WHMCS AddTransaction with credit=true) — for money that belongs to a
+     * known client but not to any single invoice. The transaction ID is the
+     * M-Pesa receipt, so WHMCS's own duplicate check protects against it
+     * being credited twice.
+     */
+    public static function creditUnmatchedToClient(int $unmatchedId, int $clientId, string $adminUsername): array
+    {
+        self::ensureTables();
+
+        $row = Capsule::table('flexpay_unmatched_payments')->where('id', $unmatchedId)->first();
+        if (!$row || $row->matched) {
+            return ['success' => false, 'message' => 'Payment not found or already resolved.'];
+        }
+
+        $client = Capsule::table('tblclients')->where('id', $clientId)->first(['id', 'currency']);
+        if (!$client) {
+            return ['success' => false, 'message' => "Client #{$clientId} does not exist."];
+        }
+        if (self::transIdExists((string) $row->trans_id)) {
+            return ['success' => false, 'message' => "Transaction {$row->trans_id} is already recorded in WHMCS."];
+        }
+        if (!function_exists('localAPI')) {
+            return ['success' => false, 'message' => 'WHMCS local API is unavailable.'];
+        }
+
+        // M-Pesa settles in KES; credit in the client's own currency.
+        $amount   = (float) $row->amount;
+        $currency = Capsule::table('tblcurrencies')->where('id', $client->currency)->first(['id', 'code', 'prefix', 'rate']);
+        if ($currency && strtoupper((string) $currency->code) !== 'KES') {
+            $kes = self::getCurrencyByCode('KES');
+            if (!$kes) {
+                return ['success' => false, 'message' => 'The client is not billed in KES and no KES currency is configured in WHMCS.'];
+            }
+            $amount = self::convertAmount($amount, $kes, $currency);
+        }
+        $amount = round($amount, 2);
+        if ($amount < 0.01) {
+            return ['success' => false, 'message' => 'Amount is too small to credit.'];
+        }
+
+        $claimed = Capsule::table('flexpay_unmatched_payments')->where('id', $unmatchedId)->where('matched', 0)
+            ->update(['matched' => 1, 'matched_by' => substr($adminUsername . ' (credit)', 0, 100), 'matched_at' => self::now()]);
+        if ($claimed !== 1) {
+            return ['success' => false, 'message' => 'This payment has already been resolved.'];
+        }
+
+        $result = localAPI('AddTransaction', [
+            'paymentmethod' => self::GATEWAY,
+            'userid'        => $clientId,
+            'transid'       => (string) $row->trans_id,
+            'amountin'      => $amount,
+            'credit'        => true,
+            'description'   => 'M-Pesa payment ' . $row->trans_id . ' credited to account balance',
+        ], $adminUsername !== '' ? $adminUsername : null);
+
+        if (($result['result'] ?? '') !== 'success') {
+            Capsule::table('flexpay_unmatched_payments')->where('id', $unmatchedId)->update(['matched' => 0, 'matched_by' => '', 'matched_at' => null]);
+            return ['success' => false, 'message' => 'WHMCS refused the transaction: ' . ($result['message'] ?? 'unknown error')];
+        }
+
+        Capsule::table('flexpay_unmatched_payments')->where('id', $unmatchedId)->update([
+            'notes' => substr('Credited to client #' . $clientId . ' account. ' . (string) $row->notes, 0, 255),
+        ]);
+        Capsule::table('flexpay_transactions')->where('mpesa_receipt', $row->trans_id)->update([
+            'client_id'   => $clientId,
+            'result_desc' => substr('Credited to client #' . $clientId . ' account balance by ' . $adminUsername, 0, 255),
+            'updated_at'  => self::now(),
+        ]);
+        self::logApiCall('credit_client', ['trans_id' => $row->trans_id, 'client_id' => $clientId, 'amount' => $amount], $result, true, $adminUsername);
+
+        $code = $currency ? strtoupper((string) $currency->code) : 'KES';
+        return ['success' => true, 'message' => "{$code} " . number_format($amount, 2) . " added to client #{$clientId}'s credit balance."];
+    }
+
+    /** Payments in the Reconciliation queue suggested for an invoice. */
+    public static function listSuggestedForInvoice(int $invoiceId): array
+    {
+        self::ensureTables();
+        try {
+            return self::rows(Capsule::table('flexpay_unmatched_payments')->where('suggested_invoice_id', $invoiceId)->where('matched', 0)
+                ->orderBy('created_at', 'desc')->take(10)->get());
+        } catch (\Throwable $e) {
+            return [];
         }
     }
 

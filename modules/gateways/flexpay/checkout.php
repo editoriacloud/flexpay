@@ -74,62 +74,10 @@ if (!$license['valid']) {
     flexpay_checkout_respond(false, 'M-Pesa payment is temporarily unavailable. Please try another payment method.');
 }
 
-$invoice = FlexPayStore::getInvoice($invoiceId);
-if (!$invoice || !in_array($invoice->status, FlexPayStore::OPEN_INVOICE_STATUSES, true)) {
-    flexpay_checkout_respond(false, 'This invoice is not awaiting payment. Please reload the page.');
+$result = FlexPayService::initiateStk($gatewayParams, $invoiceId, $phone, 'customer', $ip);
+
+if (!$result['success']) {
+    flexpay_checkout_respond(false, $result['message']);
 }
 
-$amount = FlexPayStore::invoiceBalanceInKes($invoiceId);
-if ($amount === null || $amount < 1) {
-    flexpay_checkout_respond(false, 'Nothing is due on this invoice. Please reload the page.');
-}
-
-$accRef    = FlexPayService::accountReference($gatewayParams, $invoiceId);
-$systemUrl = FlexPayStore::systemUrl($gatewayParams);
-$shortcode = (string) ($gatewayParams['businessShortcode'] ?? '');
-
-$response = DarajaClient::fromGatewayParams($gatewayParams)->stkPush([
-    'shortcode'       => $shortcode,
-    'passkey'         => (string) ($gatewayParams['passkey'] ?? ''),
-    'amount'          => $amount,
-    'phone'           => $phone,
-    'txnType'         => ($gatewayParams['transactionType'] ?? '') ?: 'CustomerPayBillOnline',
-    'partyB'          => DarajaClient::stkPartyB($gatewayParams),
-    'accountRef'      => $accRef,
-    'transactionDesc' => 'Invoice ' . $invoiceId,
-    'callbackUrl'     => FlexPaySecurity::callbackUrl($systemUrl, 'stk_result'),
-]);
-
-$success = DarajaClient::isAccepted($response);
-
-FlexPayStore::logApiCall('stk_push', ['invoice_id' => $invoiceId, 'phone' => $phone, 'amount' => $amount], $response, $success, 'customer');
-logTransaction('FlexPay (Daraja)', array_merge(['_invoice_id' => $invoiceId, '_phone' => $phone, '_amount' => $amount], $response), $success ? 'STK Push Initiated' : 'STK Push Rejected');
-
-$checkoutId = (string) ($response['CheckoutRequestID'] ?? '');
-
-if (!$success || $checkoutId === '') {
-    // Daraja's own errorMessage values are customer-safe ("Invalid PhoneNumber" etc.)
-    // but transport/internal details are not shown.
-    $message = !empty($response['errorMessage']) && is_string($response['errorMessage'])
-        ? $response['errorMessage']
-        : 'We could not send the payment prompt right now. Please try again, or pay manually using the details below.';
-    flexpay_checkout_respond(false, $message);
-}
-
-FlexPayStore::recordTransaction([
-    'channel'             => 'stk',
-    'direction'           => 'in',
-    'invoice_id'          => $invoiceId,
-    'client_id'           => (int) $invoice->userid,
-    'checkout_request_id' => $checkoutId,
-    'merchant_request_id' => (string) ($response['MerchantRequestID'] ?? ''),
-    'phone'               => $phone,
-    'amount'              => $amount,
-    'account_reference'   => $accRef,
-    'status'              => 'pending',
-    'raw_request'         => json_encode(['shortcode' => $shortcode, 'amount' => $amount, 'phone' => $phone, 'ip' => $ip]),
-]);
-
-flexpay_checkout_respond(true, (string) ($response['CustomerMessage'] ?? 'Prompt sent! Enter your M-Pesa PIN on your phone.'), [
-    'checkout_request_id' => $checkoutId,
-]);
+flexpay_checkout_respond(true, $result['message'], ['checkout_request_id' => $result['checkout_request_id']]);

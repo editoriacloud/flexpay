@@ -248,7 +248,8 @@ function ageRow(string $checkoutId, int $seconds): void
 section('Pure helpers');
 // ═════════════════════════════════════════════════════════════════════════════
 
-$refs = ['INV-42' => 42, 'inv42' => 42, 'Inv 0042' => 42, '42' => 42, '0000042' => 42, 'INV-42-A' => 42, 'ACC 2 PLAN 7' => null, '0712345678' => null, 'garbage' => null, '' => null, 'INV#7' => 7];
+$refs = ['INV-42' => 42, 'inv42' => 42, 'Inv 0042' => 42, '42' => 42, '0000042' => 42, 'INV#7' => 7, ' inv - 42 ' => 42,
+    'INV-42-A' => null, 'INV 23 and 24' => null, 'PAY INV42' => null, 'ACC 2 PLAN 7' => null, '0712345678' => null, 'garbage' => null, '' => null, 'INV' => null, 'INV-0' => null];
 $ok = true;
 foreach ($refs as $in => $want) {
     if (FlexPayStore::parseInvoiceRef((string) $in, 'INV') !== $want) {
@@ -256,7 +257,8 @@ foreach ($refs as $in => $want) {
         echo "      parseInvoiceRef('{$in}') = " . var_export(FlexPayStore::parseInvoiceRef((string) $in, 'INV'), true) . "\n";
     }
 }
-check('parseInvoiceRef tolerates typos and refuses to guess on ambiguity', $ok);
+check('parseInvoiceRef: formatting variants accepted, anything extra rejected', $ok);
+check('bare invoice number can be disabled', FlexPayStore::parseInvoiceRef('42', 'INV', false) === null && FlexPayStore::parseInvoiceRef('INV-42', 'INV', false) === 42);
 
 check('formatPhone normalises Kenyan numbers', DarajaClient::formatPhone('0712 345 678') === '254712345678'
     && DarajaClient::formatPhone('+254 110 000 111') === '254110000111' && DarajaClient::formatPhone('712345678') === '254712345678'
@@ -401,7 +403,9 @@ check('retried C2B confirmation is idempotent', count(ledger(3)) === 1);
 setGw('trustedProxies', '127.0.0.1');
 [$code] = http('POST', cbUrl('c2b_receipt', false), [], c2bPayload('TILL00PHON', 777, '', hash('sha256', '254733999888')), ['X-Forwarded-For: 196.201.214.200']);
 check('Safaricom IP via trusted proxy is accepted (legacy un-keyed C2B URL)', $code === 200);
-check('Till payment matched by hashed payer phone + amount', invoiceStatus(4) === 'Paid');
+check('Till payment (no reference) is NOT applied even when phone + amount match', invoiceStatus(4) === 'Unpaid');
+$u = DB::table('flexpay_unmatched_payments')->where('trans_id', 'TILL00PHON')->first();
+check('…it is queued with the phone/amount match as a suggestion only', $u && (int) $u->suggested_invoice_id === 4 && stripos($u->notes, 'suggestion') !== false, $u->notes ?? '');
 setGw('trustedProxies', '');
 
 http('POST', cbUrl('c2b_receipt'), [], c2bPayload('PART000001', 1000, 'RENT', '254712345678'));
@@ -418,6 +422,78 @@ check('C2B for an already-paid invoice goes to reconciliation, not silently cred
 http('POST', cbUrl('c2b_receipt'), [], c2bPayload('USD0000001', 1299, 'INV-10', '254722000111'));
 $l = ledger(10);
 check('KES payment on a USD invoice is converted before crediting', invoiceStatus(10) === 'Paid' && count($l) === 1 && abs((float) $l[0]->amountin - 10.0) < 0.01, json_encode($l));
+
+// ═════════════════════════════════════════════════════════════════════════════
+section('Rigid reference matching (no reference match → never auto-paid)');
+// ═════════════════════════════════════════════════════════════════════════════
+$inv(20, 1, 1000);  // client 1 (0712345678)
+$inv(21, 3, 2500);
+$inv(22, 3, 4100);
+$inv(23, 1, 640);
+
+http('POST', cbUrl('c2b_receipt'), [], c2bPayload('RIGID00001', 1000, 'HELLO', '254712345678'));
+check('same amount + payer\'s own phone but wrong reference → NOT paid', invoiceStatus(20) === 'Unpaid' && count(ledger(20)) === 0);
+check('…queued for manual reconciliation', DB::table('flexpay_unmatched_payments')->where('trans_id', 'RIGID00001')->where('matched', 0)->exists());
+
+http('POST', cbUrl('c2b_receipt'), [], c2bPayload('RIGID00002', 1000, '', hash('sha256', '254712345678')));
+check('same amount + hashed payer phone, no reference (Till) → NOT paid', invoiceStatus(20) === 'Unpaid');
+
+setGw('c2bAmountOnlyMatching', 'on');
+http('POST', cbUrl('c2b_receipt'), [], c2bPayload('RIGID00003', 2500, 'RANDOM', '254700000055'));
+check('amount-only matching cannot be switched back on (legacy setting ignored)', invoiceStatus(21) === 'Unpaid');
+setGw('c2bAmountOnlyMatching', '');
+
+startCheckout(22, 'ws_CO_22', '0733999888');
+http('POST', cbUrl('c2b_receipt'), [], c2bPayload('RIGID00004', 4100, 'SOMETHING', '254733999888'));
+check('paybill payment with a different reference is not linked to a pending STK for the same amount', invoiceStatus(22) === 'Unpaid'
+    && FlexPayStore::findTransactionByCheckoutId('ws_CO_22')->status === 'pending');
+
+http('POST', cbUrl('c2b_receipt'), [], c2bPayload('RIGID00005', 999, 'INV-20', '254700000066'));
+check('correct reference is applied even from an unknown phone (partial)', count(ledger(20)) === 1 && (float) ledger(20)[0]->amountin === 999.0);
+
+http('POST', cbUrl('c2b_receipt'), [], c2bPayload('RIGID00006', 640, 'INV 23 and 24', '254700000066'));
+check('reference that merely contains the invoice number among other text → NOT paid', invoiceStatus(23) === 'Unpaid');
+
+http('POST', cbUrl('c2b_receipt'), [], c2bPayload('RIGID00007', 640, 'inv-0023', '254700000066'));
+check('formatting variants of the exact reference (case, dash, zeros) still match', invoiceStatus(23) === 'Paid');
+
+
+DB::table('tblinvoices')->where('id', 23)->update(['status' => 'Unpaid']);
+DB::statement("UPDATE tblinvoices SET total = 640 WHERE id = 23");
+if (!DB::schema()->hasColumn('tblinvoices', 'invoicenum')) {
+    DB::schema()->table('tblinvoices', function ($t) { $t->string('invoicenum')->default(''); });
+}
+$inv(24, 1, 1500);
+$inv(25, 3, 870);
+DB::table('tblinvoices')->where('id', 24)->update(['invoicenum' => '2026-0077']);
+http('POST', cbUrl('c2b_receipt'), [], c2bPayload('RIGID00008', 1500, '2026-0077', '254700000066'));
+check('WHMCS custom invoice number (invoicenum) is accepted as the reference', invoiceStatus(24) === 'Paid');
+DB::table('tblinvoices')->where('id', 25)->update(['invoicenum' => '26']);
+$inv(26, 3, 870);
+http('POST', cbUrl('c2b_receipt'), [], c2bPayload('RIGID00009', 870, '26', '254700000066'));
+check('reference that is invoice ID of one invoice and invoicenum of another → ambiguous, NOT paid', invoiceStatus(25) === 'Unpaid' && invoiceStatus(26) === 'Unpaid'
+    && stripos((string) DB::table('flexpay_unmatched_payments')->where('trans_id', 'RIGID00009')->value('notes'), 'more than one') !== false);
+
+$inv(27, 2, 50.00); // USD
+http('POST', cbUrl('c2b_receipt'), [], c2bPayload('TINYUSD001', 0.5, 'INV-27', '254700000066'));
+check('payment converting to < 0.01 is never passed to addInvoicePayment (0 = full balance in WHMCS)', invoiceStatus(27) === 'Unpaid' && count(ledger(27)) === 0);
+
+// Till echo arrives BEFORE the STK callback: queued, then absorbed when STK confirms (exists once, credited once).
+setGw('transactionType', 'CustomerBuyGoodsOnline');
+$inv(28, 1, 330);
+startCheckout(28, 'ws_CO_28');
+DB::table('flexpay_transactions')->where('checkout_request_id', 'ws_CO_28')->update(['phone' => '254799000555']);
+http('POST', cbUrl('c2b_receipt'), [], c2bPayload('TILLECHO01', 330, '', '254799000555'));
+http('POST', cbUrl('stk_result'), [], stkCallback('ws_CO_28', 0, 'TILLECHO01', 330, '254799000555'));
+check('Till C2B echo + STK result for the same payment: credited once', invoiceStatus(28) === 'Paid' && count(ledger(28)) === 1);
+setGw('transactionType', 'CustomerPayBillOnline');
+
+$inv(29, 1, 410);
+startCheckout(29, 'ws_CO_29');
+DB::table('tblinvoices')->where('id', 29)->update(['status' => 'Cancelled']);
+http('POST', cbUrl('stk_result'), [], stkCallback('ws_CO_29', 0, 'STKCANCEL1', 410));
+check('STK payment for an invoice cancelled meanwhile goes to reconciliation, not credit', count(ledger(29)) === 0
+    && DB::table('flexpay_unmatched_payments')->where('trans_id', 'STKCANCEL1')->where('matched', 0)->exists());
 
 // ═════════════════════════════════════════════════════════════════════════════
 section('Invoice poller');
@@ -453,7 +529,11 @@ http('POST', cbUrl('c2b_receipt'), [], c2bPayload('SELF000450', 450, 'my account
 [$code, $res] = http('POST', '/modules/gateways/flexpay/verify.php', ['invoice_id' => 8, 'token' => FlexPaySecurity::invoiceToken(8), 'reference' => 'my account']);
 check('guessing an account reference can\'t claim someone\'s payment', !($res['applied'] ?? true) && invoiceStatus(8) === 'Unpaid');
 [$code, $res] = http('POST', '/modules/gateways/flexpay/verify.php', ['invoice_id' => 8, 'token' => FlexPaySecurity::invoiceToken(8), 'reference' => 'self000450']);
-check('the payer\'s receipt number applies their unmatched payment', ($res['applied'] ?? false) && invoiceStatus(8) === 'Paid', json_encode($res));
+check('default (queue) mode: receipt is flagged for staff, invoice NOT auto-paid', ($res['success'] ?? false) && !($res['applied'] ?? true) && invoiceStatus(8) === 'Unpaid'
+    && (int) DB::table('flexpay_unmatched_payments')->where('trans_id', 'SELF000450')->value('suggested_invoice_id') === 8, json_encode($res));
+setGw('selfVerifyMode', 'apply');
+[$code, $res] = http('POST', '/modules/gateways/flexpay/verify.php', ['invoice_id' => 8, 'token' => FlexPaySecurity::invoiceToken(8), 'reference' => 'self000450']);
+check('"apply" mode: the payer\'s receipt number applies their unmatched payment', ($res['applied'] ?? false) && invoiceStatus(8) === 'Paid', json_encode($res));
 check('…and clears it from the reconciliation queue', (int) DB::table('flexpay_unmatched_payments')->where('trans_id', 'SELF000450')->value('matched') === 1);
 [$code, $res] = http('POST', '/modules/gateways/flexpay/verify.php', ['invoice_id' => 9, 'token' => FlexPaySecurity::invoiceToken(9), 'reference' => 'RC3A0B1C2D']);
 check('a receipt belonging to another invoice is "not found", not disclosed', !($res['success'] ?? true) && strpos($res['message'], '#3') === false);
@@ -548,6 +628,70 @@ check('daily housekeeping runs', DB::table('flexpay_api_log')->where('operation'
 
 $res = FlexPayDashboardActions::handle(['fp_action' => 'test_connection', 'fp_csrf' => $csrf], 'boss');
 check('Test Configuration action reports OAuth + HTTPS', strpos($res['message'], 'OAuth: OK') !== false && strpos($res['message'], 'HTTPS OK') !== false, $res['message']);
+
+// ═════════════════════════════════════════════════════════════════════════════
+section('WHMCS-native integrations');
+// ═════════════════════════════════════════════════════════════════════════════
+$validate = function (array $overrides) {
+    try {
+        flexpay_config_validate(array_merge(getGatewayVariables('flexpay'), $overrides));
+        return 'ok';
+    } catch (\WHMCS\Exception\Module\InvalidConfiguration $e) {
+        return $e->getMessage();
+    }
+};
+check('_config_validate accepts the current settings', $validate([]) === 'ok');
+check('_config_validate rejects a bad shortcode / prefix / proxy CIDR', strpos($validate(['businessShortcode' => '12ab']), 'Shortcode') !== false
+    && strpos($validate(['accountRefPrefix' => 'INVOICE-LONG']), 'Prefix') !== false
+    && strpos($validate(['trustedProxies' => '10.0.0.0/99']), 'Trusted Proxies') !== false);
+check('_config_validate refuses Callback Security "off" in live mode', strpos($validate(['callbackSecurity' => 'off', 'testMode' => '']), 'Callback Security') !== false
+    && $validate(['callbackSecurity' => 'off', 'testMode' => 'on']) === 'ok');
+
+$bal = flexpay_account_balance(getGatewayVariables('flexpay'));
+check('_account_balance returns WHMCS Balance objects from the latest snapshot', $bal instanceof \WHMCS\Module\Gateway\BalanceCollection
+    && (float) $bal->items[0]->amount === 700000.0 && $bal->items[0]->currency === 'KES');
+
+$info = flexpay_TransactionInformation(['transactionId' => 'SKA1B2C3D4']);
+check('_TransactionInformation describes a FlexPay receipt', ($info->data['amount'] ?? null) === 1500.0 && ($info->data['currency'] ?? '') === 'KES'
+    && ($info->data['type'] ?? '') === 'M-Pesa STK Push');
+
+check('successful M-Pesa reversal is recorded natively via WHMCS paymentReversed()', DB::table('fp_test_log')->where('kind', 'reversed')->where('message', 'REVNEW0001 RC3A0B1C2D')->exists()
+    && invoiceStatus(3) === 'Collections');
+
+$inv(30, 1, 2750);
+$fields = FlexPayWhmcsIntegration::emailMergeFields(['messagename' => 'Invoice Created', 'relid' => 30, 'mergefields' => ['invoice_id' => 30]]);
+check('EmailPreSend adds paybill / account / amount / instructions merge fields', ($fields['flexpay_account'] ?? '') === 'INV-30' && ($fields['flexpay_paybill'] ?? '') === '174379'
+    && ($fields['flexpay_amount_kes'] ?? '') === 'KES 2,750' && strpos($fields['flexpay_instructions'] ?? '', 'Account No. INV-30') !== false);
+check('EmailPreSend adds nothing to non-invoice emails', FlexPayWhmcsIntegration::emailMergeFields(['messagename' => 'Password Reset', 'relid' => 1, 'mergefields' => []]) === []);
+check('EmailTplMergeFields lists the fields for invoice templates only', isset(FlexPayWhmcsIntegration::emailTemplateFields(['type' => 'invoice'])['flexpay_instructions'])
+    && FlexPayWhmcsIntegration::emailTemplateFields(['type' => 'general']) === []);
+
+$panel = FlexPayWhmcsIntegration::adminInvoicePanel(['invoiceid' => 20, 'paymentmethod' => 'flexpay']);
+check('admin invoice panel lists payments, suggestions and the STK button', strpos($panel, 'RIGID00005') !== false && strpos($panel, 'RIGID00001') !== false
+    && strpos($panel, 'value="admin_stk"') !== false && strpos($panel, 'fp_csrf') !== false);
+check('admin invoice panel is hidden for unrelated invoices', FlexPayWhmcsIntegration::adminInvoicePanel(['invoiceid' => 30, 'paymentmethod' => 'banktransfer']) === '');
+
+resetRateLimits();
+mockDaraja('/mpesa/stkpush/v1/processrequest', ['MerchantRequestID' => 'm-adm', 'CheckoutRequestID' => 'ws_CO_ADMIN', 'ResponseCode' => '0', 'ResponseDescription' => 'Success', 'CustomerMessage' => 'Success']);
+$res = FlexPayDashboardActions::handle(['fp_action' => 'admin_stk', 'invoice_id' => 30, 'phone' => '0712345678', 'fp_csrf' => $csrf], 'boss');
+$row = FlexPayStore::findTransactionByCheckoutId('ws_CO_ADMIN');
+check('admin can send an STK prompt for an invoice', $res['success'] && $row && (int) $row->invoice_id === 30 && (float) $row->amount === 2750.0, $res['message']);
+
+$u = DB::table('flexpay_unmatched_payments')->where('trans_id', 'RIGID00002')->first();
+$res = FlexPayDashboardActions::handle(['fp_action' => 'credit_client', 'unmatched_id' => $u->id, 'client_id' => 1, 'fp_csrf' => $csrf], 'boss');
+check('unmatched payment credited to client account via WHMCS AddTransaction', $res['success'] && DB::table('tblaccounts')->where('transid', 'RIGID00002')->exists()
+    && DB::table('fp_test_log')->where('kind', 'localapi')->where('message', 'like', 'AddTransaction%"credit":true%')->exists(), $res['message']);
+$res = FlexPayDashboardActions::handle(['fp_action' => 'credit_client', 'unmatched_id' => $u->id, 'client_id' => 1, 'fp_csrf' => $csrf], 'boss');
+check('…and cannot be credited twice', !$res['success']);
+
+$ml = FlexPayStore::rows(DB::table('fp_test_log')->where('kind', 'modulelog')->get());
+$mlLeak = false;
+foreach ($ml as $l) {
+    if (strpos($l->message, 'SECRET-PASSKEY-VALUE') !== false || strpos($l->message, 'ENCRYPTED-CRED') !== false || preg_match('/"Password":"(?!\[redacted\])/', $l->message)) {
+        $mlLeak = true;
+    }
+}
+check('Daraja calls reach the WHMCS Module Log with credentials redacted', count($ml) > 0 && !$mlLeak);
 
 // ═════════════════════════════════════════════════════════════════════════════
 section('Dashboard rendering & access');

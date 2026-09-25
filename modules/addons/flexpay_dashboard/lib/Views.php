@@ -487,7 +487,7 @@ class FlexPayViews
     {
         $items = FlexPayStore::listUnmatched(true);
 
-        $html = '<p style="color:#888;font-size:13px;margin-bottom:14px;">These payments could not be matched to an open invoice automatically (typo\'d account number, Till payment from an unknown phone, already-paid invoice, …). '
+        $html = '<p style="color:#888;font-size:13px;margin-bottom:14px;">FlexPay only applies a payment automatically when its account reference is exactly one open invoice. Everything else lands here: a different or mistyped account number, Till payments (no reference), or a reference to an invoice that is already paid or cancelled. Suggestions from the payer\'s phone and the amount are pre-filled but never applied without you. '
             . 'Apply each one to the right invoice — it is recorded exactly as if it had matched automatically — or dismiss payments that aren\'t for any invoice.</p>';
 
         if (empty($items)) {
@@ -496,11 +496,13 @@ class FlexPayViews
 
         $html .= '<table class="fp-table"><thead><tr>'
             . '<th>Date</th><th>Receipt</th><th>Phone</th><th>Customer Name</th><th>Entered Reference</th>'
-            . '<th>Amount</th><th>Match to Invoice</th><th></th></tr></thead><tbody>';
+            . '<th>Amount</th><th>Apply to Invoice</th><th>Credit to Client</th><th></th></tr></thead><tbody>';
 
         foreach ($items as $item) {
             $hint      = trim((string) ($item->notes ?? ''));
             $suggested = $item->suggested_invoice_id ? (int) $item->suggested_invoice_id : '';
+            $suggestedInvoice = $suggested !== '' ? FlexPayStore::getInvoice((int) $suggested) : null;
+            $suggestedClient  = $suggestedInvoice ? (int) $suggestedInvoice->userid : '';
 
             $html .= '<tr>'
                 . '<td>' . self::e($item->created_at) . '</td>'
@@ -517,6 +519,13 @@ class FlexPayViews
                 . '<button type="submit" class="fp-btn" style="padding:6px 12px;" onclick="return confirm(\'Apply KES ' . number_format((float) $item->amount, 2) . ' to this invoice?\');">Apply</button>'
                 . '</form>'
                 . '</td><td>'
+                . '<form method="post" style="display:flex;gap:6px;margin:0;">' . FlexPaySecurity::csrfField()
+                . '<input type="hidden" name="fp_action" value="credit_client">'
+                . '<input type="hidden" name="unmatched_id" value="' . (int) $item->id . '">'
+                . '<input class="fp-input" style="width:90px;" type="number" min="1" name="client_id" placeholder="Client #" value="' . self::e($suggestedClient) . '" required>'
+                . '<button type="submit" class="fp-btn fp-btn-outline" style="padding:6px 10px;" title="Add to the client\'s account credit balance (not to an invoice)" onclick="return confirm(\'Add KES ' . number_format((float) $item->amount, 2) . ' to this client\\\'s credit balance?\');">Credit</button>'
+                . '</form>'
+                . '</td><td>'
                 . '<form method="post" style="margin:0;" onsubmit="var r=prompt(\'Why dismiss this payment? (e.g. not a billing payment)\');if(r===null)return false;this.dismiss_reason.value=r;return true;">' . FlexPaySecurity::csrfField()
                 . '<input type="hidden" name="fp_action" value="dismiss_unmatched">'
                 . '<input type="hidden" name="unmatched_id" value="' . (int) $item->id . '">'
@@ -526,7 +535,7 @@ class FlexPayViews
                 . '</td></tr>';
 
             if ($hint) {
-                $html .= '<tr><td></td><td colspan="7" style="font-size:11px;color:#856404;background:#fffbf0;padding:6px 10px;">&#128161; ' . self::e($hint) . '</td></tr>';
+                $html .= '<tr><td></td><td colspan="8" style="font-size:11px;color:#856404;background:#fffbf0;padding:6px 10px;">&#128161; ' . self::e($hint) . '</td></tr>';
             }
         }
 

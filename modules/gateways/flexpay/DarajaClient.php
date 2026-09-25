@@ -15,7 +15,7 @@
  *   - Dynamic QR code generation
  *
  * @package   FlexPay\Daraja
- * @version   3.5.0
+ * @version   3.6.0
  * @link      https://developer.safaricom.co.ke/Documentation
  */
 
@@ -27,7 +27,7 @@ class DarajaClient
 {
     private const SANDBOX_URL = 'https://sandbox.safaricom.co.ke';
     private const LIVE_URL    = 'https://api.safaricom.co.ke';
-    private const USER_AGENT  = 'FlexPay-Daraja-Client/3.5';
+    private const USER_AGENT  = 'FlexPay-Daraja-Client/3.6';
 
     /** @deprecated Use FlexPaySecurity::SAFARICOM_CALLBACK_IPS */
     public const SAFARICOM_CALLBACK_IPS = FlexPaySecurity::SAFARICOM_CALLBACK_IPS;
@@ -501,6 +501,8 @@ class DarajaClient
             }
             $decoded['_http_code'] = $status;
 
+            self::moduleLog($path, $payload, $decoded, $token);
+
             $tokenRejected = $status === 401
                 || in_array((string) ($decoded['errorCode'] ?? ''), ['404.001.03', '401.003.01'], true);
 
@@ -516,6 +518,27 @@ class DarajaClient
         }
 
         return ['errorMessage' => 'Daraja rejected the access token.'];
+    }
+
+    /**
+     * Record the call in WHMCS's Module Log (Utilities → Logs → Module Log;
+     * only written while module debug logging is switched on). Credentials
+     * are redacted before logging and also passed as WHMCS "replace vars".
+     */
+    private static function moduleLog(string $path, array $payload, array $response, string $token): void
+    {
+        if (!function_exists('logModuleCall')) {
+            return;
+        }
+        $redacted = class_exists('FlexPayStore') ? FlexPayStore::redact($payload) : $payload;
+        $secrets  = array_values(array_filter([
+            $token, $payload['Password'] ?? null, $payload['SecurityCredential'] ?? null,
+        ]));
+        try {
+            logModuleCall('flexpay', $path, $redacted, $response, $response, $secrets);
+        } catch (\Throwable $e) {
+            // logging must never break a payment
+        }
     }
 
     /**

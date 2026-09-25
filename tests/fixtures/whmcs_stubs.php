@@ -11,6 +11,7 @@ if (!defined('WHMCS')) {
 }
 
 require_once __DIR__ . '/../vendor/autoload.php';
+require_once __DIR__ . '/classes/whmcs_classes.php';
 
 use Illuminate\Database\Capsule\Manager;
 
@@ -73,6 +74,7 @@ function fp_test_create_whmcs_tables(): void
         $t->increments('id');
         $t->integer('userid');
         $t->decimal('total', 10, 2);
+        $t->string('invoicenum')->default('');
         $t->string('status')->default('Unpaid');
         $t->date('duedate')->nullable();
     });
@@ -222,4 +224,35 @@ function fp_test_daraja_transport(string $method, string $url, array $headers, ?
         return [500, json_encode(['errorMessage' => 'no mock for ' . $path])];
     }
     return [(int) $mock->status, $mock->body];
+}
+
+// ── WHMCS 8.x APIs used by FlexPay's native integrations ─────────────────────
+
+function localAPI($command, $params, $admin = null)
+{
+    Manager::table('fp_test_log')->insert(['kind' => 'localapi', 'message' => $command . ' ' . json_encode($params)]);
+    if ($command === 'AddTransaction') {
+        if (Manager::table('tblaccounts')->where('transid', $params['transid'])->exists()) {
+            return ['result' => 'error', 'message' => 'Transaction ID must be unique'];
+        }
+        Manager::table('tblaccounts')->insert(['invoiceid' => (int) ($params['invoiceid'] ?? 0), 'gateway' => $params['paymentmethod'], 'transid' => $params['transid'], 'amountin' => $params['amountin']]);
+        return ['result' => 'success'];
+    }
+    return ['result' => 'error', 'message' => 'unsupported in tests'];
+}
+
+function paymentReversed($reverseTransactionId, $originalTransactionId)
+{
+    $orig = Manager::table('tblaccounts')->where('transid', $originalTransactionId)->first();
+    if (!$orig) {
+        throw new \Exception('Original transaction not found');
+    }
+    Manager::table('tblaccounts')->insert(['invoiceid' => $orig->invoiceid, 'gateway' => $orig->gateway, 'transid' => $reverseTransactionId, 'amountout' => $orig->amountin]);
+    Manager::table('tblinvoices')->where('id', $orig->invoiceid)->update(['status' => 'Collections']);
+    Manager::table('fp_test_log')->insert(['kind' => 'reversed', 'message' => $reverseTransactionId . ' ' . $originalTransactionId]);
+}
+
+function logModuleCall($module, $action, $request, $response, $processed = '', $replace = [])
+{
+    Manager::table('fp_test_log')->insert(['kind' => 'modulelog', 'message' => $action . ' ' . json_encode($request) . ' REPLACE:' . count($replace)]);
 }

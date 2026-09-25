@@ -11,7 +11,7 @@
  * Install location: modules/addons/flexpay_dashboard/flexpay_dashboard.php
  *
  * @package   FlexPay\Dashboard
- * @version   1.4.0
+ * @version   1.5.0
  * @link      https://developers.whmcs.com/addon-modules/
  */
 
@@ -35,7 +35,7 @@ function flexpay_dashboard_config()
     return [
         'name'        => 'FlexPay Dashboard (M-Pesa / Daraja)',
         'description' => 'Unified management console for the FlexPay M-Pesa gateway: transactions, refunds, C2B reconciliation, account balance, and API logs.',
-        'version'     => '1.4.0',
+        'version'     => '1.5.0',
         'author'      => 'Editoria Cloud Systems',
         'fields'      => [
             'access_roles' => [

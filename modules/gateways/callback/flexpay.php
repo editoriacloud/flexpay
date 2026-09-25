@@ -235,10 +235,11 @@ function flexpay_cb_c2b_check(array $payload, array $gw): void
         return;
     }
 
-    $invoiceId = FlexPayStore::parseInvoiceRef($billRef, (string) ($gw['accountRefPrefix'] ?? 'INV'));
-    $invoice   = $invoiceId !== null ? FlexPayStore::getInvoice($invoiceId) : null;
+    // Same rigid rule as the confirmation step: the account number must be
+    // exactly one open invoice.
+    $resolved = FlexPayStore::resolveInvoiceReference($billRef, $gw);
 
-    if (!$invoice || !in_array($invoice->status, FlexPayStore::OPEN_INVOICE_STATUSES, true)) {
+    if ($resolved['reason'] !== 'matched') {
         logTransaction($gw['name'], $payload, 'C2B Validation REJECTED (strict) – Ref: ' . $billRef);
         echo json_encode(['ResultCode' => 'C2B00012', 'ResultDesc' => 'Rejected']);
         return;
@@ -511,9 +512,25 @@ function flexpay_cb_reversal_result(array $payload, array $gw, bool $isTimeout):
             ->where('status', 'success')
             ->update(['status' => 'reversed', 'updated_at' => FlexPayStore::now()]);
 
+        // Let WHMCS record the reversal natively (reversal transaction on the
+        // invoice, invoice → Collections, due dates reverted) when the
+        // original payment was credited to an invoice.
+        $whmcsNote = '';
+        $credited  = Capsule::table('tblaccounts')->where('transid', $original)->where('gateway', 'flexpay')->exists();
+        if ($credited && function_exists('paymentReversed')) {
+            try {
+                paymentReversed($reversalTxnId !== '' ? $reversalTxnId : ('REV-' . $original), $original);
+                $whmcsNote = ' WHMCS has recorded the reversal on the invoice.';
+            } catch (\Throwable $e) {
+                $whmcsNote = ' WHMCS could not record the reversal automatically (' . $e->getMessage() . ') — record it on the invoice manually.';
+            }
+        } elseif ($credited) {
+            $whmcsNote = ' Record the refund on the invoice in WHMCS.';
+        }
+
         if (function_exists('logActivity')) {
             logActivity('FlexPay: M-Pesa transaction ' . $original . ' was reversed'
-                . (($originalRow && $originalRow->invoice_id) ? ' — record the refund on Invoice #' . (int) $originalRow->invoice_id . ' in WHMCS if it was paid by this transaction.' : '.'));
+                . (($originalRow && $originalRow->invoice_id) ? ' (Invoice #' . (int) $originalRow->invoice_id . ').' : '.') . $whmcsNote);
         }
     }
 
@@ -583,11 +600,11 @@ function flexpay_parse_balance_string(string $raw): array
  * Status queries are sent by the customer "Verify your payment" box and the
  * admin Verify tool when a receipt isn't on file. When the result confirms
  * a completed payment INTO one of our shortcodes, it's recorded and:
- *   - admin query with an invoice → applied to that invoice;
- *   - customer query → applied only if the paying phone matches the
- *     invoice's client; otherwise queued for one-click admin approval
- *     (a receipt alone isn't enough to move a stranger's money onto an
- *     invoice without a human looking at it).
+ *   - admin query with an invoice → applied to that invoice (an admin
+ *     chose the invoice, which is manual reconciliation);
+ *   - customer query → queued for one-click admin approval with the
+ *     invoice pre-filled. Only with Self-Verify Mode = "apply" AND the
+ *     paying phone matching the invoice's client is it applied directly.
  */
 function flexpay_cb_status_result(array $payload, array $gw): void
 {
@@ -650,7 +667,7 @@ function flexpay_cb_status_result(array $payload, array $gw): void
     $autoApply = false;
     if ($invoiceId > 0 && ($context['purpose'] ?? '') === 'admin_verify') {
         $autoApply = true;
-    } elseif ($invoiceId > 0 && ($context['purpose'] ?? '') === 'customer_verify') {
+    } elseif ($invoiceId > 0 && ($context['purpose'] ?? '') === 'customer_verify' && FlexPayStore::selfVerifyApplies($gw)) {
         $invoice = FlexPayStore::getInvoice($invoiceId);
         $client  = $invoice ? Capsule::table('tblclients')->where('id', $invoice->userid)->first(['phonenumber']) : null;
         $autoApply = $client && FlexPayStore::phoneMatches((string) $client->phonenumber, $payerPhone);
@@ -672,7 +689,7 @@ function flexpay_cb_status_result(array $payload, array $gw): void
         'bill_ref'             => '(verified by status query)',
         'customer_name'        => trim(implode(' - ', array_slice(explode(' - ', $debitParty), 1))),
         'notes'                => $invoiceId > 0
-            ? "Customer on Invoice #{$invoiceId} submitted this receipt via self-verify; paying phone doesn't match the client's, so approve manually if correct."
+            ? "Confirmed by Safaricom. Customer on Invoice #{$invoiceId} submitted this receipt via self-verify — approve to apply it."
             : 'Confirmed by Transaction Status query; not linked to an invoice.',
         'suggested_invoice_id' => $invoiceId ?: null,
         'raw_data'             => json_encode($result),

@@ -27,6 +27,117 @@ class FlexPayService
     }
 
     // ─────────────────────────────────────────────────────────────────────
+    // STK Push initiation (customer checkout + admin "send prompt")
+    // ─────────────────────────────────────────────────────────────────────
+
+    /**
+     * Send an STK prompt for an invoice's outstanding balance. Every value
+     * sent to Safaricom is derived here, server-side, from the invoice and
+     * the gateway settings.
+     *
+     * @return array ['success' => bool, 'message' => string, 'checkout_request_id' => ?string]
+     */
+    public static function initiateStk(array $gw, int $invoiceId, string $phone, string $actor, string $clientIp = ''): array
+    {
+        $fail = function (string $message) {
+            return ['success' => false, 'message' => $message, 'checkout_request_id' => null];
+        };
+
+        $phone = DarajaClient::formatPhone($phone);
+        if ($phone === '') {
+            return $fail('Invalid Safaricom phone number. Use format 07XXXXXXXX or 01XXXXXXXX.');
+        }
+
+        $invoice = FlexPayStore::getInvoice($invoiceId);
+        if (!$invoice || !in_array($invoice->status, FlexPayStore::OPEN_INVOICE_STATUSES, true)) {
+            return $fail('This invoice is not awaiting payment.');
+        }
+
+        $amount = FlexPayStore::invoiceBalanceInKes($invoiceId);
+        if ($amount === null) {
+            return $fail('This invoice is not in KES and no KES currency/exchange rate is configured in WHMCS.');
+        }
+        if ($amount < 1) {
+            return $fail('Nothing is due on this invoice.');
+        }
+
+        $accRef    = self::accountReference($gw, $invoiceId);
+        $shortcode = (string) ($gw['businessShortcode'] ?? '');
+
+        $response = DarajaClient::fromGatewayParams($gw)->stkPush([
+            'shortcode'       => $shortcode,
+            'passkey'         => (string) ($gw['passkey'] ?? ''),
+            'amount'          => $amount,
+            'phone'           => $phone,
+            'txnType'         => ($gw['transactionType'] ?? '') ?: 'CustomerPayBillOnline',
+            'partyB'          => DarajaClient::stkPartyB($gw),
+            'accountRef'      => $accRef,
+            'transactionDesc' => 'Invoice ' . $invoiceId,
+            'callbackUrl'     => FlexPaySecurity::callbackUrl(FlexPayStore::systemUrl($gw), 'stk_result'),
+        ]);
+
+        $success    = DarajaClient::isAccepted($response);
+        $checkoutId = (string) ($response['CheckoutRequestID'] ?? '');
+
+        FlexPayStore::logApiCall('stk_push', ['invoice_id' => $invoiceId, 'phone' => $phone, 'amount' => $amount], $response, $success, $actor);
+        if (function_exists('logTransaction')) {
+            logTransaction('FlexPay (Daraja)', array_merge(['_invoice_id' => $invoiceId, '_phone' => $phone, '_amount' => $amount, '_by' => $actor], $response), $success ? 'STK Push Initiated' : 'STK Push Rejected');
+        }
+
+        if (!$success || $checkoutId === '') {
+            // Daraja's own errorMessage values are customer-safe ("Invalid PhoneNumber").
+            return $fail(!empty($response['errorMessage']) && is_string($response['errorMessage'])
+                ? $response['errorMessage']
+                : 'We could not send the payment prompt right now. Please try again, or pay manually using the details shown.');
+        }
+
+        FlexPayStore::recordTransaction([
+            'channel'             => 'stk',
+            'direction'           => 'in',
+            'invoice_id'          => $invoiceId,
+            'client_id'           => (int) $invoice->userid,
+            'checkout_request_id' => $checkoutId,
+            'merchant_request_id' => (string) ($response['MerchantRequestID'] ?? ''),
+            'phone'               => $phone,
+            'amount'              => $amount,
+            'account_reference'   => $accRef,
+            'status'              => 'pending',
+            'raw_request'         => json_encode(['shortcode' => $shortcode, 'amount' => $amount, 'phone' => $phone, 'ip' => $clientIp, 'by' => $actor]),
+        ]);
+
+        return [
+            'success'             => true,
+            'message'             => (string) ($response['CustomerMessage'] ?? 'Prompt sent! Enter your M-Pesa PIN on your phone.'),
+            'checkout_request_id' => $checkoutId,
+            'amount'              => $amount,
+        ];
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Account balance (async — result arrives at ?route=balance_result)
+    // ─────────────────────────────────────────────────────────────────────
+
+    public static function requestBalance(array $gw, array $initiator, string $actor): array
+    {
+        $systemUrl = FlexPayStore::systemUrl($gw);
+        $response  = DarajaClient::fromGatewayParams($gw)->accountBalance([
+            'initiatorName'      => $initiator['name'],
+            'securityCredential' => $initiator['credential'],
+            'partyA'             => DarajaClient::c2bShortcode($gw),
+            'identifierType'     => '4',
+            'resultUrl'          => FlexPaySecurity::callbackUrl($systemUrl, 'balance_result'),
+            'timeoutUrl'         => FlexPaySecurity::callbackUrl($systemUrl, 'balance_timeout'),
+        ]);
+
+        $success = DarajaClient::isAccepted($response);
+        FlexPayStore::logApiCall('balance_query', ['shortcode' => DarajaClient::c2bShortcode($gw)], $response, $success, $actor);
+
+        return $success
+            ? ['success' => true, 'message' => 'Balance query sent. Refresh the Balance tab in 10–30 seconds for the result.']
+            : ['success' => false, 'message' => 'Balance request failed: ' . DarajaClient::errorMessage($response)];
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // C2B URL registration
     // ─────────────────────────────────────────────────────────────────────
 

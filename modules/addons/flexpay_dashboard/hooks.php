@@ -4,10 +4,13 @@
  *
  * WHMCS loads this file on every request while the addon is active.
  *
- *   AdminHomeWidgets — live 7-day stats card on the admin homepage
- *   AfterCronJob     — resolves STK pushes whose callback never arrived
- *   DailyCronJob     — housekeeping (rate-limit rows, old API log) and the
- *                      optional daily Account Balance snapshot
+ *   AdminHomeWidgets            — live 7-day stats card on the admin homepage
+ *   AdminInvoicesControlsOutput — M-Pesa panel on the admin invoice page
+ *   EmailPreSend                — M-Pesa payment instructions merge fields
+ *   EmailTplMergeFields         — …listed in the invoice email template editor
+ *   AfterCronJob                — resolves STK pushes whose callback never arrived
+ *   DailyCronJob                — housekeeping (rate-limit rows, old API log) and
+ *                                 the optional daily Account Balance snapshot
  *
  * @see https://developers.whmcs.com/hooks/module-hooks/
  * @see https://developers.whmcs.com/addon-modules/admin-dashboard-widgets/
@@ -22,6 +25,7 @@ require_once __DIR__ . '/../../gateways/flexpay/DarajaClient.php';
 require_once __DIR__ . '/../../gateways/flexpay/FlexPayStore.php';
 require_once __DIR__ . '/../../gateways/flexpay/FlexPayLicense.php';
 require_once __DIR__ . '/../../gateways/flexpay/FlexPayService.php';
+require_once __DIR__ . '/lib/WhmcsIntegration.php';
 
 use WHMCS\Database\Capsule;
 
@@ -33,6 +37,26 @@ if (class_exists('\WHMCS\Module\AbstractWidget')) {
         return new FlexPayStatsWidget();
     });
 }
+
+add_hook('AdminInvoicesControlsOutput', 1, function ($vars) {
+    try {
+        return FlexPayWhmcsIntegration::adminInvoicePanel((array) $vars);
+    } catch (\Throwable $e) {
+        return '';
+    }
+});
+
+add_hook('EmailPreSend', 1, function ($vars) {
+    try {
+        return FlexPayWhmcsIntegration::emailMergeFields((array) $vars);
+    } catch (\Throwable $e) {
+        return [];
+    }
+});
+
+add_hook('EmailTplMergeFields', 1, function ($vars) {
+    return FlexPayWhmcsIntegration::emailTemplateFields((array) $vars);
+});
 
 /** This addon's saved settings (hooks don't receive $vars). */
 function flexpay_dashboard_hook_settings(): array
