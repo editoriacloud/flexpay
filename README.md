@@ -9,18 +9,24 @@ and reversals — all without touching the WHMCS API or shell.
 
 1. **FlexPay Gateway Module** (`modules/gateways/flexpay.php`)
    - STK Push (Lipa Na M-Pesa Online) checkout widget with live polling
-   - Fully automated C2B (Paybill) payment reconciliation
-   - B2C refunds (triggered automatically by WHMCS's native Refund button)
+   - Fully automated C2B (Paybill **and** Till/Buy Goods) payment reconciliation
+   - B2C refunds (triggered automatically by WHMCS's native Refund button),
+     paid to the phone number that actually paid
+   - Optional Daraja **Dynamic QR code** the customer scans in the M-Pesa app
    - Manual-paybill fallback shown to customers who prefer the M-Pesa menu
+   - Multi-currency: invoices in USD/EUR/etc. are charged in KES at your
+     WHMCS exchange rates, and payments are converted back when credited
 
 2. **FlexPay Dashboard Addon Module** (`modules/addons/flexpay_dashboard/`)
    - Overview: live stats, account balance, unmatched-payment alerts
-   - Transactions: full searchable/filterable ledger of every STK/C2B/B2C/Reversal
-   - Refunds: tracks every B2C disbursement and its outcome
-   - Reconciliation: one-click matching of unmatched C2B payments to invoices
-   - Balance: on-demand Account Balance Query + historical trend
-   - Tools: Transaction Status Query, Transaction Reversal, force C2B re-registration, sandbox C2B simulator
-   - API Log: full audit trail of every Daraja API call, automated or manual
+   - Transactions: searchable/filterable ledger (channel, status, date range) with **CSV export**
+   - Refunds: tracks every B2C disbursement and its outcome, with **one-click retry** of failed refunds
+   - Reconciliation: one-click matching of unmatched payments to invoices (pre-filled suggestions), or dismiss
+   - Balance: on-demand or daily Account Balance snapshots + history
+   - Tools: Verify a Payment, Test Configuration, Resolve Pending STK, Transaction Status Query,
+     Transaction Reversal, force C2B re-registration, sandbox C2B simulator
+   - API Log: audit trail of every Daraja call and security event, filterable, secrets redacted
+   - Cron: automatically settles STK payments whose callback never arrived, prunes old logs
 
 3. **Admin Homepage Widget** — a live 7-day stats card on the WHMCS admin
    dashboard homepage, with a link straight into the full Dashboard.
@@ -48,6 +54,38 @@ your domain or shortcode afterward. FlexPay instead:
   before Safaricom finalizes the payment, if you'd rather customers
   retype than have anything land unmatched.
 
+## Security model (v3.5.0+)
+
+FlexPay moves money, so every entry point is authenticated:
+
+- **No secrets in the browser.** The invoice widget carries only a signed,
+  expiring token for that one invoice. Amount, shortcode, passkey, account
+  reference and callback URL are always derived on the server.
+- **Authenticated callbacks.** Every Daraja callback URL contains a secret
+  per-route key generated for your install. The *Callback Security*
+  setting decides what is accepted: key **or** a Safaricom source IP
+  (default — keeps production shortcodes registered before v3.5 working),
+  key only, IP only, or off (not recommended). A forged "payment received"
+  request is rejected and logged.
+- **Double-checked STK results.** A successful STK callback is confirmed
+  with Daraja's STK Query API before the invoice is credited, and the amount
+  credited is always the amount FlexPay asked Safaricom to collect.
+- **Exactly-once crediting.** Callback retries, the C2B echo Safaricom
+  sends for STK payments, the invoice poller, and the cron sweeper can all
+  report the same payment. Database-level locking means it is applied once.
+- **Customer self-verify** accepts M-Pesa receipt numbers only (the value
+  only the payer has), is locked to the invoice, and is rate-limited per
+  invoice and per IP.
+- **Admin dashboard**: CSRF-protected actions, enforced role list, secrets
+  redacted from the API log, OAuth tokens cached encrypted in the database
+  (not in the shared `/tmp`).
+- **Rate limits** on STK prompts (per IP, invoice and phone) stop the
+  widget being used to spam someone's phone with PIN prompts.
+
+If WHMCS sits behind Cloudflare or another reverse proxy, list the proxy's
+IP ranges under **Trusted Proxies** so Safaricom's real IP is seen. Only
+listed proxies may set `X-Forwarded-For`.
+
 ## Installation
 
 1. Upload the full contents of this package to your WHMCS root, preserving
@@ -55,7 +93,11 @@ your domain or shortcode afterward. FlexPay instead:
 2. **Activate the gateway:** Setup → Payments → Payment Gateways → find
    "M-Pesa via FlexPay (Daraja)" under the Inactive tab → Activate, then
    fill in your Consumer Key/Secret, Shortcode, Passkey, and (for refunds/
-   reversals/balance/status) your B2C Initiator Name + Security Credential.
+   reversals/balance/status) your Initiator Name + Security Credential.
+   Instead of the encrypted Security Credential you can enter the Initiator
+   Password and paste Safaricom's public certificate, and FlexPay encrypts
+   it for you. Buy Goods merchants: set the Till Number field if your till
+   differs from your store number.
 3. **Activate the dashboard:** Setup → Addon Modules → find "FlexPay
    Dashboard (M-Pesa / Daraja)" → Activate → Configure (defaults are fine
    for most installs).
@@ -64,7 +106,11 @@ your domain or shortcode afterward. FlexPay instead:
    automatically once the addon is active — no further setup needed.
 5. Open **Addon Modules → FlexPay Dashboard** any time to see live
    transactions, reconcile payments, check your balance, or run a
-   reversal/status query.
+   reversal/status query. Run **Tools → Test Configuration** once after
+   setup.
+6. Make sure the WHMCS cron is running. The dashboard addon uses it to
+   settle STK payments whose Safaricom callback was lost, even if the
+   customer closed the page.
 
 ## Database tables created automatically
 
@@ -77,26 +123,34 @@ idempotently on first load/activation.
 ## Callback URLs
 
 All Daraja callbacks route through a single file using a `?route=`
-parameter — never the word "mpesa" — so they blend in with general
-billing-system traffic in server logs:
+parameter — never the word "mpesa", which Daraja rejects in C2B URLs:
 
 ```
-https://yourdomain.com/modules/gateways/callback/flexpay.php?route=stk_result
-https://yourdomain.com/modules/gateways/callback/flexpay.php?route=c2b_check
-https://yourdomain.com/modules/gateways/callback/flexpay.php?route=c2b_receipt
-https://yourdomain.com/modules/gateways/callback/flexpay.php?route=disbursement_result
-https://yourdomain.com/modules/gateways/callback/flexpay.php?route=reversal_result
-https://yourdomain.com/modules/gateways/callback/flexpay.php?route=balance_result
-https://yourdomain.com/modules/gateways/callback/flexpay.php?route=status_result
+https://yourdomain.com/modules/gateways/callback/flexpay.php?route=stk_result&k=<secret>
+https://yourdomain.com/modules/gateways/callback/flexpay.php?route=c2b_check&k=<secret>
+https://yourdomain.com/modules/gateways/callback/flexpay.php?route=c2b_receipt&k=<secret>
+https://yourdomain.com/modules/gateways/callback/flexpay.php?route=disbursement_result&k=<secret>
+https://yourdomain.com/modules/gateways/callback/flexpay.php?route=reversal_result&k=<secret>
+https://yourdomain.com/modules/gateways/callback/flexpay.php?route=balance_result&k=<secret>
+https://yourdomain.com/modules/gateways/callback/flexpay.php?route=status_result&k=<secret>
 ```
 
-These are wired up and sent to Daraja automatically — you never need to
-register or type them yourself.
+These are generated and sent to Daraja automatically, so you never need
+to register or type them yourself. Each `k=` is a per-install, per-route
+secret.
+
+**Upgrading a live shortcode from v3.4?** Safaricom normally lets
+production C2B URLs be registered only once, so the new keyed URLs may be
+refused ("already registered"). FlexPay detects this, stops retrying, and
+shows a note in the dashboard. Your existing URLs keep working through the
+Safaricom-IP check. To switch to keyed URLs, delete the old URLs in the
+Daraja portal (or ask Safaricom), then use **Tools → Force Re-Register**.
 
 ## Requirements
 
 - WHMCS 7.x or 8.x with Capsule/Eloquent database support (standard since WHMCS 6.0)
-- PHP 7.4+ (tested against PHP 8.3)
+- PHP 7.4+ (tested against PHP 8.4)
+- The WHMCS cron (for the pending-payment sweeper and housekeeping)
 - A Daraja app (sandbox or production) from https://developer.safaricom.co.ke
 - HTTPS on your WHMCS install (Safaricom rejects HTTP callback URLs)
 - cURL extension (standard with PHP)
@@ -107,6 +161,21 @@ register or type them yourself.
 Status, Account Balance), Dashboard addon, admin widget, intelligent C2B
 automation.
 
+## Testing
+
+`tests/` contains an end-to-end suite (not shipped in the release zip). It
+serves the real module files from a throwaway fake WHMCS root through PHP's
+built-in web server, mocks Daraja, and drives the checkout, poll, verify
+and callback endpoints over HTTP. Refunds, dashboard actions, cron hooks
+and rendering run in-process.
+
+```bash
+cd tests && composer install
+php run.php                                  # SQLite
+FP_TEST_MYSQL=fp_e2e php run.php             # MySQL/MariaDB (user fp/fp on 127.0.0.1)
+FP_TEST_MYSQL=fp_migration php migration.php # upgrade a real v3.4.0 schema
+```
+
 ## Customer self-verification (v3.1.0+)
 
 Every invoice rendered by the FlexPay gateway now includes an
@@ -114,9 +183,13 @@ Every invoice rendered by the FlexPay gateway now includes an
 instructions. Customers can enter their M-Pesa receipt number themselves
 and get an instant answer — no need to wait for support.
 
-This is intentionally invoice-locked and rate-limited (see
+This is intentionally receipt-only, invoice-locked and rate-limited (see
 `modules/gateways/flexpay/verify.php` and
 `FlexPayStore::verifyPaymentForInvoice()` for the exact security model).
+If the receipt isn't on file yet, FlexPay asks Safaricom (Transaction
+Status Query). A confirmed payment from the client's own phone is applied
+automatically. One from another phone is queued in Reconciliation with the
+invoice pre-filled, for one-click approval.
 If you ever need to clear a stuck rate limit for a customer who's made
 several genuine retries, use **Tools → Reset Customer Verify Limit** in
 the FlexPay Dashboard addon.
@@ -129,17 +202,22 @@ already did, so the customer and admin both see exactly what happened
 ("KES 200 credited to your account balance") instead of a silent side
 effect.
 
+Invoice balances are computed from the WHMCS ledger (`tblaccounts`) the
+same way WHMCS does; `tblinvoices` has no balance column. Before v3.5 this
+meant the partial/overpayment messages and hints never actually appeared.
+
 Partial payments (WHMCS has no distinct "Partially Paid" status — these
 stay Unpaid/Overdue with a reduced balance) are now visible everywhere:
 the customer sees "KES X still due" immediately after paying, and the
 Transactions tab shows a PARTIAL badge at a glance.
 
-For Till (Buy Goods) payments specifically — which carry no account
-reference at all — a partial payment can never be auto-applied (there's
-no reliable way to know which of several open invoices it's meant for),
-but the Reconciliation tab will flag it with "Possible partial payment
-toward: #X (balance KES Y)" so reconciling it takes one click instead of
-investigation from scratch.
+For Till (Buy Goods) payments, which carry no account reference, FlexPay
+matches the **payer's phone** (including the SHA-256-hashed MSISDN that
+C2B v2 sends) against clients with exactly one open invoice for that
+amount. Matching by amount alone is available but off by default, because
+it can credit the wrong customer. A partial payment is never auto-applied.
+The Reconciliation tab flags it with "Possible partial payment toward: #X
+(balance KES Y, same phone)" and pre-fills the likeliest invoice.
 
 ## Licensing (v3.4.0+)
 
