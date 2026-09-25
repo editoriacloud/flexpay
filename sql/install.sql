@@ -7,6 +7,10 @@
 -- EXISTS / idempotent).
 --
 -- Compatible with: MySQL 5.7+, MariaDB 10.3+
+--
+-- Schema version 3 (FlexPay 3.5.0). Upgrading from 3.4.x? Do NOT re-import
+-- this file — the modules migrate existing tables automatically on first
+-- load (see FlexPayStore::migrate()).
 -- ============================================================================
 
 -- ────────────────────────────────────────────────────────────────────────────
@@ -21,12 +25,12 @@ CREATE TABLE IF NOT EXISTS `flexpay_transactions` (
     `direction`           ENUM('in','out') NOT NULL DEFAULT 'in' COMMENT 'in = customer paid us, out = we paid customer',
     `invoice_id`          INT UNSIGNED   NULL,
     `client_id`           INT UNSIGNED   NULL,
-    `checkout_request_id` VARCHAR(100)   NOT NULL DEFAULT '' COMMENT 'STK only',
+    `checkout_request_id` VARCHAR(100)   NULL DEFAULT NULL COMMENT 'STK only; NULL (not empty) when absent — unique index',
     `merchant_request_id` VARCHAR(100)   NOT NULL DEFAULT '' COMMENT 'STK only',
     `conversation_id`     VARCHAR(100)   NOT NULL DEFAULT '' COMMENT 'B2C/Reversal only',
     `originator_conversation_id` VARCHAR(100) NOT NULL DEFAULT '',
-    `mpesa_receipt`       VARCHAR(30)    NOT NULL DEFAULT '' COMMENT 'Safaricom transaction code, e.g. NLJ7RT61SV',
-    `phone`               VARCHAR(15)    NOT NULL DEFAULT '',
+    `mpesa_receipt`       VARCHAR(30)    NULL DEFAULT NULL COMMENT 'Safaricom transaction code, e.g. NLJ7RT61SV; NULL when unknown — unique index',
+    `phone`               VARCHAR(64)    NOT NULL DEFAULT '' COMMENT 'MSISDN, masked MSISDN, or C2B v2 SHA-256 hash',
     `amount`               DECIMAL(12,2) NOT NULL DEFAULT 0.00,
     `account_reference`   VARCHAR(50)    NOT NULL DEFAULT '',
     `status`              ENUM('pending','success','failed','reversed') NOT NULL DEFAULT 'pending',
@@ -35,6 +39,7 @@ CREATE TABLE IF NOT EXISTS `flexpay_transactions` (
     `payment_outcome`     VARCHAR(20)    NULL COMMENT 'exact, partial, overpaid — observational only',
     `raw_request`         TEXT           NULL,
     `raw_response`        TEXT           NULL,
+    `last_checked_at`     DATETIME       NULL COMMENT 'last live STK status query (poller / cron sweeper)',
     `created_at`          DATETIME       NOT NULL,
     `updated_at`          DATETIME       NULL,
     PRIMARY KEY (`id`),
@@ -45,7 +50,8 @@ CREATE TABLE IF NOT EXISTS `flexpay_transactions` (
     KEY `idx_channel`     (`channel`),
     KEY `idx_status`      (`status`),
     KEY `idx_created_at`  (`created_at`),
-    KEY `idx_phone`       (`phone`)
+    KEY `idx_phone`       (`phone`),
+    KEY `flexpay_transactions_conversation_id_index` (`conversation_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   COMMENT='Master ledger of every STK/C2B/B2C/Reversal transaction';
 
@@ -58,12 +64,13 @@ CREATE TABLE IF NOT EXISTS `flexpay_unmatched_payments` (
     `id`           INT UNSIGNED  NOT NULL AUTO_INCREMENT,
     `trans_id`     VARCHAR(30)   NOT NULL,
     `amount`       DECIMAL(12,2) NOT NULL,
-    `phone`        VARCHAR(15)   NOT NULL DEFAULT '',
+    `phone`        VARCHAR(64)   NOT NULL DEFAULT '',
     `bill_ref`     VARCHAR(50)   NOT NULL DEFAULT '',
     `customer_name` VARCHAR(150) NOT NULL DEFAULT '',
     `raw_data`     TEXT          NULL,
     `matched`      TINYINT(1)    NOT NULL DEFAULT 0,
     `matched_invoice_id` INT UNSIGNED NULL,
+    `suggested_invoice_id` INT UNSIGNED NULL COMMENT 'pre-filled in the Reconciliation tab',
     `matched_by`   VARCHAR(100)  NOT NULL DEFAULT '' COMMENT 'admin username who reconciled it',
     `notes`        VARCHAR(255)  NOT NULL DEFAULT '',
     `created_at`   DATETIME      NOT NULL,
@@ -84,19 +91,22 @@ CREATE TABLE IF NOT EXISTS `flexpay_unmatched_payments` (
 CREATE TABLE IF NOT EXISTS `flexpay_refunds` (
     `id`               INT UNSIGNED   NOT NULL AUTO_INCREMENT,
     `invoice_id`       INT UNSIGNED   NOT NULL,
-    `original_trans_id` VARCHAR(30)  NOT NULL DEFAULT '' COMMENT 'the M-Pesa receipt being refunded',
+    `original_trans_id` VARCHAR(100) NOT NULL DEFAULT '' COMMENT 'the M-Pesa receipt (or STK checkout ID) being refunded',
     `conversation_id`  VARCHAR(100)   NOT NULL DEFAULT '',
+    `originator_conversation_id` VARCHAR(100) NOT NULL DEFAULT '' COMMENT 'B2C v3 OriginatorConversationID',
     `phone`            VARCHAR(15)    NOT NULL,
     `amount`           DECIMAL(12,2)  NOT NULL,
     `status`           ENUM('pending','success','failed') NOT NULL DEFAULT 'pending',
     `result_desc`      VARCHAR(255)   NOT NULL DEFAULT '',
     `initiated_by`     VARCHAR(100)   NOT NULL DEFAULT '' COMMENT 'admin username',
+    `retried_as`       INT UNSIGNED   NULL COMMENT 'id of the refund row that retried this failed one',
     `created_at`       DATETIME       NOT NULL,
     `updated_at`       DATETIME       NULL,
     PRIMARY KEY (`id`),
     KEY `idx_invoice_id`   (`invoice_id`),
     KEY `idx_status`       (`status`),
     KEY `idx_conversation` (`conversation_id`),
+    KEY `idx_originator`   (`originator_conversation_id`),
     KEY `idx_created_at`   (`created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   COMMENT='B2C refund disbursements initiated from WHMCS';
@@ -155,3 +165,5 @@ CREATE TABLE IF NOT EXISTS `flexpay_settings` (
     PRIMARY KEY (`setting_key`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   COMMENT='Cross-module key-value settings store (e.g. last C2B registration)';
+
+INSERT IGNORE INTO `flexpay_settings` (`setting_key`, `setting_value`, `updated_at`) VALUES ('schema_version', '3', NOW());

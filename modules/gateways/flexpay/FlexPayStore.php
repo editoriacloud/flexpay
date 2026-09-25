@@ -4,10 +4,12 @@
  *
  * Wraps every read/write touching the flexpay_* tables so both the
  * gateway module and the dashboard addon manipulate data identically.
- * Also owns table auto-creation (idempotent, safe to call every request).
+ * Also owns table auto-creation and versioned migrations (idempotent,
+ * safe to call every request), and every path that applies money to a
+ * WHMCS invoice — so the rules for doing that safely live in one place.
  *
  * @package FlexPay\Daraja
- * @version 3.0.0
+ * @version 3.5.0
  */
 
 if (!defined('WHMCS')) {
@@ -18,52 +20,61 @@ use WHMCS\Database\Capsule;
 
 class FlexPayStore
 {
+    /** Bump when ensureTables() gains a migration. */
+    public const SCHEMA_VERSION = 3;
+
+    /** Invoice statuses a payment can be auto-applied to without a human deciding. */
+    public const OPEN_INVOICE_STATUSES = ['Unpaid', 'Overdue', 'Payment Pending'];
+
+    public const GATEWAY = 'flexpay';
+
+    // ─────────────────────────────────────────────────────────────────────
+    // WHMCS function library loading
+    // ─────────────────────────────────────────────────────────────────────
+
     /**
-     * Ensure getGatewayVariables() and friends (checkCbInvoiceID,
-     * addInvoicePayment, etc.) are loaded and callable.
-     *
-     * WHMCS auto-loads includes/gatewayfunctions.php only for gateway
-     * module and gateway callback requests — NOT for addon-module admin
-     * pages. Any addon code that calls getGatewayVariables() directly
-     * will fatal with "Call to undefined function" unless this is called
-     * first. Safe to call repeatedly; does nothing once already loaded.
-     *
-     * @return void
+     * Ensure getGatewayVariables(), logTransaction() etc. are callable.
+     * WHMCS only auto-loads includes/gatewayfunctions.php for gateway and
+     * callback requests, not for addon pages or cron hooks.
      */
     public static function ensureGatewayFunctionsLoaded(): void
     {
-        if (function_exists('getGatewayVariables')) {
+        self::loadWhmcsLibrary('getGatewayVariables', 'gateway', 'gatewayfunctions.php');
+    }
+
+    /** Ensure addInvoicePayment() is callable (includes/invoicefunctions.php). */
+    public static function ensureInvoiceFunctionsLoaded(): void
+    {
+        self::loadWhmcsLibrary('addInvoicePayment', 'invoice', 'invoicefunctions.php');
+    }
+
+    private static function loadWhmcsLibrary(string $probe, string $name, string $file): void
+    {
+        if (function_exists($probe)) {
             return;
         }
 
         if (class_exists('App')) {
             try {
-                \App::load_function('gateway');
+                \App::load_function($name);
             } catch (\Throwable $e) {
-                // fall through to the direct-require fallback below
+                // fall through to the direct require below
             }
         }
 
-        if (!function_exists('getGatewayVariables')) {
-            // Fallback for any WHMCS version/context where App::load_function
-            // isn't available — require the file directly. This file
-            // (FlexPayStore.php) lives at modules/gateways/flexpay/, so
-            // reaching WHMCS root's includes/ needs exactly 2 parent steps.
-            $fallbackPath = __DIR__ . '/../../../includes/gatewayfunctions.php';
-            if (is_file($fallbackPath)) {
-                require_once $fallbackPath;
+        if (!function_exists($probe)) {
+            // This file lives at modules/gateways/flexpay/, three levels
+            // below the WHMCS root.
+            $path = __DIR__ . '/../../../includes/' . $file;
+            if (is_file($path)) {
+                require_once $path;
             }
         }
     }
 
     /**
-     * Convenience wrapper: load the gateway function library if needed,
-     * then return the FlexPay gateway module's saved configuration.
-     * Returns ['type' => ''] (meaning "not active") if the function
-     * library could not be loaded at all, so callers can check
-     * $gw['type'] exactly as they would from a real gateway-context call.
-     *
-     * @return array
+     * The FlexPay gateway's saved configuration. Returns ['type' => ''] if
+     * the gateway library can't be loaded, so callers can check $gw['type'].
      */
     public static function getFlexPayGatewayParams(): array
     {
@@ -73,14 +84,22 @@ class FlexPayStore
             return ['type' => ''];
         }
 
-        return getGatewayVariables('flexpay');
+        $gw = getGatewayVariables(self::GATEWAY);
+        return is_array($gw) ? $gw : ['type' => ''];
     }
 
+    public static function now(): string
+    {
+        return date('Y-m-d H:i:s');
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Schema
+    // ─────────────────────────────────────────────────────────────────────
+
     /**
-     * Idempotently create all flexpay_* tables. Safe to call on every
-     * request — exits almost immediately once tables exist.
-     *
-     * @return void
+     * Idempotently create/migrate all flexpay_* tables. Once the stored
+     * schema_version matches SCHEMA_VERSION this costs one indexed read.
      */
     public static function ensureTables(): void
     {
@@ -97,143 +116,226 @@ class FlexPayStore
         try {
             $schema = Capsule::schema();
 
-            if (!$schema->hasTable('flexpay_transactions')) {
-                $schema->create('flexpay_transactions', function ($table) {
-                    /** @var \Illuminate\Database\Schema\Blueprint $table */
-                    $table->increments('id');
-                    $table->enum('channel', ['stk', 'c2b', 'b2c', 'reversal']);
-                    $table->enum('direction', ['in', 'out'])->default('in');
-                    $table->unsignedInteger('invoice_id')->nullable();
-                    $table->unsignedInteger('client_id')->nullable();
-                    $table->string('checkout_request_id', 100)->default('');
-                    $table->string('merchant_request_id', 100)->default('');
-                    $table->string('conversation_id', 100)->default('');
-                    $table->string('originator_conversation_id', 100)->default('');
-                    $table->string('mpesa_receipt', 30)->default('');
-                    $table->string('phone', 15)->default('');
-                    $table->decimal('amount', 12, 2)->default(0);
-                    $table->string('account_reference', 50)->default('');
-                    $table->enum('status', ['pending', 'success', 'failed', 'reversed'])->default('pending');
-                    $table->string('result_code', 20)->default('');
-                    $table->string('result_desc', 255)->default('');
-                    $table->string('payment_outcome', 20)->nullable()->comment('exact, partial, overpaid — observational only, see classifyPaymentOutcome()');
-                    $table->text('raw_request')->nullable();
-                    $table->text('raw_response')->nullable();
-                    $table->dateTime('created_at');
-                    $table->dateTime('updated_at')->nullable();
-
-                    $table->unique('checkout_request_id', 'uq_checkout_request_id');
-                    $table->unique('mpesa_receipt', 'uq_mpesa_receipt');
-                    $table->index('invoice_id');
-                    $table->index('client_id');
-                    $table->index('channel');
-                    $table->index('status');
-                    $table->index('created_at');
-                    $table->index('phone');
-                });
+            if ($schema->hasTable('flexpay_settings')) {
+                $row = Capsule::table('flexpay_settings')->where('setting_key', 'schema_version')->first();
+                if ($row && (int) $row->setting_value >= self::SCHEMA_VERSION) {
+                    return;
+                }
             }
 
-            if (!$schema->hasTable('flexpay_unmatched_payments')) {
-                $schema->create('flexpay_unmatched_payments', function ($table) {
-                    /** @var \Illuminate\Database\Schema\Blueprint $table */
-                    $table->increments('id');
-                    $table->string('trans_id', 30)->unique();
-                    $table->decimal('amount', 12, 2);
-                    $table->string('phone', 15)->default('');
-                    $table->string('bill_ref', 50)->default('');
-                    $table->string('customer_name', 150)->default('');
-                    $table->text('raw_data')->nullable();
-                    $table->boolean('matched')->default(false);
-                    $table->unsignedInteger('matched_invoice_id')->nullable();
-                    $table->string('matched_by', 100)->default('');
-                    $table->string('notes', 255)->default('');
-                    $table->dateTime('created_at');
-                    $table->dateTime('matched_at')->nullable();
+            self::createTables($schema);
+            self::migrate($schema);
 
-                    $table->index('matched');
-                    $table->index('created_at');
-                });
-            }
-
-            if (!$schema->hasTable('flexpay_refunds')) {
-                $schema->create('flexpay_refunds', function ($table) {
-                    /** @var \Illuminate\Database\Schema\Blueprint $table */
-                    $table->increments('id');
-                    $table->unsignedInteger('invoice_id');
-                    $table->string('original_trans_id', 30)->default('');
-                    $table->string('conversation_id', 100)->default('');
-                    $table->string('phone', 15);
-                    $table->decimal('amount', 12, 2);
-                    $table->enum('status', ['pending', 'success', 'failed'])->default('pending');
-                    $table->string('result_desc', 255)->default('');
-                    $table->string('initiated_by', 100)->default('');
-                    $table->dateTime('created_at');
-                    $table->dateTime('updated_at')->nullable();
-
-                    $table->index('invoice_id');
-                    $table->index('status');
-                    $table->index('conversation_id');
-                    $table->index('created_at');
-                });
-            }
-
-            if (!$schema->hasTable('flexpay_balance_snapshots')) {
-                $schema->create('flexpay_balance_snapshots', function ($table) {
-                    /** @var \Illuminate\Database\Schema\Blueprint $table */
-                    $table->increments('id');
-                    $table->string('shortcode', 20);
-                    $table->decimal('working_account', 14, 2)->default(0);
-                    $table->decimal('utility_account', 14, 2)->default(0);
-                    $table->decimal('charges_account', 14, 2)->default(0);
-                    $table->text('raw_response')->nullable();
-                    $table->dateTime('created_at');
-
-                    $table->index('shortcode');
-                    $table->index('created_at');
-                });
-            }
-
-            if (!$schema->hasTable('flexpay_api_log')) {
-                $schema->create('flexpay_api_log', function ($table) {
-                    /** @var \Illuminate\Database\Schema\Blueprint $table */
-                    $table->increments('id');
-                    $table->string('operation', 40);
-                    $table->text('request_data')->nullable();
-                    $table->text('response_data')->nullable();
-                    $table->boolean('success')->default(false);
-                    $table->string('triggered_by', 100)->default('');
-                    $table->dateTime('created_at');
-
-                    $table->index('operation');
-                    $table->index('success');
-                    $table->index('created_at');
-                });
-            }
-
-            if (!$schema->hasTable('flexpay_settings')) {
-                $schema->create('flexpay_settings', function ($table) {
-                    /** @var \Illuminate\Database\Schema\Blueprint $table */
-                    $table->string('setting_key', 100)->primary();
-                    $table->text('setting_value')->nullable();
-                    $table->dateTime('updated_at');
-                });
-            }
-
-            // ── Additive migrations for installs upgrading from an earlier
-            // FlexPay version, where flexpay_transactions already exists
-            // but predates the partial/overpayment tracking column. Safe
-            // to run on every load — hasColumn() short-circuits instantly
-            // once the column exists.
-            if ($schema->hasTable('flexpay_transactions') && !$schema->hasColumn('flexpay_transactions', 'payment_outcome')) {
-                $schema->table('flexpay_transactions', function ($table) {
-                    /** @var \Illuminate\Database\Schema\Blueprint $table */
-                    $table->string('payment_outcome', 20)->nullable()->after('result_desc');
-                });
-            }
-        } catch (\Exception $e) {
+            self::setSetting('schema_version', (string) self::SCHEMA_VERSION);
+        } catch (\Throwable $e) {
             if (function_exists('logActivity')) {
-                logActivity('FlexPay: table auto-creation failed — ' . $e->getMessage());
+                logActivity('FlexPay: table auto-creation/migration failed — ' . $e->getMessage());
             }
+        }
+    }
+
+    private static function createTables($schema): void
+    {
+        if (!$schema->hasTable('flexpay_transactions')) {
+            $schema->create('flexpay_transactions', function ($table) {
+                /** @var \Illuminate\Database\Schema\Blueprint $table */
+                $table->increments('id');
+                $table->enum('channel', ['stk', 'c2b', 'b2c', 'reversal']);
+                $table->enum('direction', ['in', 'out'])->default('in');
+                $table->unsignedInteger('invoice_id')->nullable();
+                $table->unsignedInteger('client_id')->nullable();
+                // NULL (not '') when absent: these carry UNIQUE indexes, and
+                // MySQL allows many NULLs but only one ''.
+                $table->string('checkout_request_id', 100)->nullable();
+                $table->string('merchant_request_id', 100)->default('');
+                $table->string('conversation_id', 100)->default('');
+                $table->string('originator_conversation_id', 100)->default('');
+                $table->string('mpesa_receipt', 30)->nullable();
+                $table->string('phone', 64)->default('');
+                $table->decimal('amount', 12, 2)->default(0);
+                $table->string('account_reference', 50)->default('');
+                $table->enum('status', ['pending', 'success', 'failed', 'reversed'])->default('pending');
+                $table->string('result_code', 20)->default('');
+                $table->string('result_desc', 255)->default('');
+                $table->string('payment_outcome', 20)->nullable();
+                $table->text('raw_request')->nullable();
+                $table->text('raw_response')->nullable();
+                $table->dateTime('last_checked_at')->nullable();
+                $table->dateTime('created_at');
+                $table->dateTime('updated_at')->nullable();
+
+                $table->unique('checkout_request_id', 'uq_checkout_request_id');
+                $table->unique('mpesa_receipt', 'uq_mpesa_receipt');
+                $table->index('invoice_id');
+                $table->index('client_id');
+                $table->index('channel');
+                $table->index('status');
+                $table->index('created_at');
+                $table->index('phone');
+                $table->index('conversation_id');
+            });
+        }
+
+        if (!$schema->hasTable('flexpay_unmatched_payments')) {
+            $schema->create('flexpay_unmatched_payments', function ($table) {
+                /** @var \Illuminate\Database\Schema\Blueprint $table */
+                $table->increments('id');
+                $table->string('trans_id', 30)->unique();
+                $table->decimal('amount', 12, 2);
+                $table->string('phone', 64)->default('');
+                $table->string('bill_ref', 50)->default('');
+                $table->string('customer_name', 150)->default('');
+                $table->text('raw_data')->nullable();
+                $table->boolean('matched')->default(false);
+                $table->unsignedInteger('matched_invoice_id')->nullable();
+                $table->unsignedInteger('suggested_invoice_id')->nullable();
+                $table->string('matched_by', 100)->default('');
+                $table->string('notes', 255)->default('');
+                $table->dateTime('created_at');
+                $table->dateTime('matched_at')->nullable();
+
+                $table->index('matched');
+                $table->index('created_at');
+            });
+        }
+
+        if (!$schema->hasTable('flexpay_refunds')) {
+            $schema->create('flexpay_refunds', function ($table) {
+                /** @var \Illuminate\Database\Schema\Blueprint $table */
+                $table->increments('id');
+                $table->unsignedInteger('invoice_id');
+                $table->string('original_trans_id', 100)->default('');
+                $table->string('conversation_id', 100)->default('');
+                $table->string('originator_conversation_id', 100)->default('');
+                $table->string('phone', 15);
+                $table->decimal('amount', 12, 2);
+                $table->enum('status', ['pending', 'success', 'failed'])->default('pending');
+                $table->string('result_desc', 255)->default('');
+                $table->string('initiated_by', 100)->default('');
+                $table->unsignedInteger('retried_as')->nullable();
+                $table->dateTime('created_at');
+                $table->dateTime('updated_at')->nullable();
+
+                $table->index('invoice_id');
+                $table->index('status');
+                $table->index('conversation_id');
+                $table->index('originator_conversation_id');
+                $table->index('created_at');
+            });
+        }
+
+        if (!$schema->hasTable('flexpay_balance_snapshots')) {
+            $schema->create('flexpay_balance_snapshots', function ($table) {
+                /** @var \Illuminate\Database\Schema\Blueprint $table */
+                $table->increments('id');
+                $table->string('shortcode', 20);
+                $table->decimal('working_account', 14, 2)->default(0);
+                $table->decimal('utility_account', 14, 2)->default(0);
+                $table->decimal('charges_account', 14, 2)->default(0);
+                $table->text('raw_response')->nullable();
+                $table->dateTime('created_at');
+
+                $table->index('shortcode');
+                $table->index('created_at');
+            });
+        }
+
+        if (!$schema->hasTable('flexpay_api_log')) {
+            $schema->create('flexpay_api_log', function ($table) {
+                /** @var \Illuminate\Database\Schema\Blueprint $table */
+                $table->increments('id');
+                $table->string('operation', 40);
+                $table->text('request_data')->nullable();
+                $table->text('response_data')->nullable();
+                $table->boolean('success')->default(false);
+                $table->string('triggered_by', 100)->default('');
+                $table->dateTime('created_at');
+
+                $table->index('operation');
+                $table->index('success');
+                $table->index('created_at');
+            });
+        }
+
+        if (!$schema->hasTable('flexpay_settings')) {
+            $schema->create('flexpay_settings', function ($table) {
+                /** @var \Illuminate\Database\Schema\Blueprint $table */
+                $table->string('setting_key', 100)->primary();
+                $table->text('setting_value')->nullable();
+                $table->dateTime('updated_at');
+            });
+        }
+    }
+
+    /**
+     * Additive migrations for installs created by earlier versions.
+     * Every step checks before it changes anything, so re-running is safe.
+     */
+    private static function migrate($schema): void
+    {
+        $addColumn = function (string $table, string $column, callable $definition) use ($schema) {
+            if ($schema->hasTable($table) && !$schema->hasColumn($table, $column)) {
+                $schema->table($table, $definition);
+            }
+        };
+
+        $addColumn('flexpay_transactions', 'payment_outcome', function ($t) {
+            $t->string('payment_outcome', 20)->nullable();
+        });
+        $addColumn('flexpay_transactions', 'last_checked_at', function ($t) {
+            $t->dateTime('last_checked_at')->nullable();
+        });
+        $addColumn('flexpay_refunds', 'originator_conversation_id', function ($t) {
+            $t->string('originator_conversation_id', 100)->default('');
+        });
+        $addColumn('flexpay_refunds', 'retried_as', function ($t) {
+            $t->unsignedInteger('retried_as')->nullable();
+        });
+        $addColumn('flexpay_unmatched_payments', 'suggested_invoice_id', function ($t) {
+            $t->unsignedInteger('suggested_invoice_id')->nullable();
+        });
+
+        // v3.4.0 and earlier declared checkout_request_id / mpesa_receipt as
+        // NOT NULL DEFAULT '' with UNIQUE indexes, so only ONE pending STK
+        // row (and one C2B row) could ever exist — every later insert failed
+        // silently. Make them nullable and turn '' into NULL. Column type
+        // changes need raw SQL (Blueprint::change() requires doctrine/dbal,
+        // which WHMCS doesn't ship); fresh installs already get nullable
+        // columns from createTables().
+        if (Capsule::connection()->getDriverName() === 'mysql') {
+            Capsule::statement(
+                'ALTER TABLE `flexpay_transactions`'
+                . ' MODIFY `checkout_request_id` VARCHAR(100) NULL DEFAULT NULL,'
+                . ' MODIFY `mpesa_receipt` VARCHAR(30) NULL DEFAULT NULL,'
+                . ' MODIFY `phone` VARCHAR(64) NOT NULL DEFAULT \'\''
+            );
+            Capsule::statement('ALTER TABLE `flexpay_unmatched_payments` MODIFY `phone` VARCHAR(64) NOT NULL DEFAULT \'\'');
+            Capsule::statement('ALTER TABLE `flexpay_refunds` MODIFY `original_trans_id` VARCHAR(100) NOT NULL DEFAULT \'\'');
+        }
+
+        Capsule::table('flexpay_transactions')->where('checkout_request_id', '')->update(['checkout_request_id' => null]);
+        Capsule::table('flexpay_transactions')->where('mpesa_receipt', '')->update(['mpesa_receipt' => null]);
+
+        if ($schema->hasTable('flexpay_transactions') && !self::hasIndex('flexpay_transactions', 'flexpay_transactions_conversation_id_index')) {
+            try {
+                $schema->table('flexpay_transactions', function ($t) {
+                    $t->index('conversation_id');
+                });
+            } catch (\Throwable $e) {
+                // index already exists under another name — fine
+            }
+        }
+    }
+
+    private static function hasIndex(string $table, string $index): bool
+    {
+        try {
+            if (Capsule::connection()->getDriverName() !== 'mysql') {
+                return true; // test/sqlite installs are always created fresh
+            }
+            return !empty(Capsule::select('SHOW INDEX FROM `' . $table . '` WHERE Key_name = ?', [$index]));
+        } catch (\Throwable $e) {
+            return true;
         }
     }
 
@@ -241,20 +343,32 @@ class FlexPayStore
     // flexpay_transactions
     // ─────────────────────────────────────────────────────────────────────
 
+    /** Empty identifiers must be stored as NULL (see createTables()). */
+    private static function normalizeIdentifiers(array $data): array
+    {
+        foreach (['checkout_request_id', 'mpesa_receipt'] as $col) {
+            if (array_key_exists($col, $data) && ($data[$col] === '' || $data[$col] === null)) {
+                $data[$col] = null;
+            }
+        }
+        foreach (['result_desc' => 255, 'account_reference' => 50, 'phone' => 64] as $col => $max) {
+            if (isset($data[$col]) && is_string($data[$col]) && strlen($data[$col]) > $max) {
+                $data[$col] = substr($data[$col], 0, $max);
+            }
+        }
+        return $data;
+    }
+
     /**
-     * Insert or update a transaction record, keyed by channel-appropriate
-     * unique identifier (checkout_request_id for STK, mpesa_receipt for
-     * everything else once known).
-     *
-     * @param  array $data
-     * @return void
+     * Insert or update a transaction record, keyed by checkout_request_id
+     * (STK) or mpesa_receipt (everything else).
      */
     public static function recordTransaction(array $data): void
     {
         self::ensureTables();
 
-        $data['updated_at'] = date('Y-m-d H:i:s');
-        $data['created_at'] = $data['created_at'] ?? date('Y-m-d H:i:s');
+        $data = self::normalizeIdentifiers($data);
+        $data['updated_at'] = self::now();
 
         try {
             $existing = null;
@@ -270,54 +384,293 @@ class FlexPayStore
             }
 
             if ($existing) {
-                unset($data['created_at']); // never overwrite original creation time
+                unset($data['created_at']);
                 Capsule::table('flexpay_transactions')->where('id', $existing->id)->update($data);
             } else {
+                $data['created_at'] = $data['created_at'] ?? self::now();
                 Capsule::table('flexpay_transactions')->insert($data);
             }
-        } catch (\Exception $e) {
-            if (function_exists('logActivity')) {
-                logActivity('FlexPay: recordTransaction failed — ' . $e->getMessage());
-            }
+        } catch (\Throwable $e) {
+            self::activity('recordTransaction failed — ' . $e->getMessage());
         }
     }
 
     /**
-     * Classify the outcome of applying a payment to an invoice — exact,
-     * partial (underpayment), or overpaid — by comparing the invoice's
-     * balance BEFORE the payment against the amount paid.
+     * Insert a row whose unique key (receipt or checkout ID) must not exist
+     * yet. The UNIQUE index turns this into an atomic "first writer wins"
+     * lock, which is what stops a retried Daraja callback being applied
+     * twice. Returns the new ID, or null if the row already existed.
+     */
+    public static function insertTransactionOnce(array $data): ?int
+    {
+        self::ensureTables();
+
+        $data = self::normalizeIdentifiers($data);
+        $data['created_at'] = $data['created_at'] ?? self::now();
+        $data['updated_at'] = self::now();
+
+        try {
+            return (int) Capsule::table('flexpay_transactions')->insertGetId($data);
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    public static function findTransactionByReceipt(string $receipt): ?object
+    {
+        self::ensureTables();
+        if ($receipt === '') {
+            return null;
+        }
+        try {
+            return Capsule::table('flexpay_transactions')->where('mpesa_receipt', $receipt)->first() ?: null;
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    public static function findTransactionByCheckoutId(string $checkoutId): ?object
+    {
+        self::ensureTables();
+        if ($checkoutId === '') {
+            return null;
+        }
+        try {
+            return Capsule::table('flexpay_transactions')->where('checkout_request_id', $checkoutId)->first() ?: null;
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    /**
+     * Admin-only lookup by receipt, checkout request ID, or account reference.
+     * NOT used by the customer-facing verify path (receipt only there).
+     */
+    public static function findTransactionByReference(string $reference): ?object
+    {
+        self::ensureTables();
+
+        $reference = trim($reference);
+        if ($reference === '') {
+            return null;
+        }
+
+        try {
+            return Capsule::table('flexpay_transactions')
+                ->where(function ($q) use ($reference) {
+                    $q->where('mpesa_receipt', $reference)
+                      ->orWhere('checkout_request_id', $reference)
+                      ->orWhere('account_reference', $reference);
+                })
+                ->orderBy('created_at', 'desc')
+                ->first() ?: null;
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Invoices, balances, currency
+    // ─────────────────────────────────────────────────────────────────────
+
+    public static function getInvoice(int $invoiceId): ?object
+    {
+        if ($invoiceId <= 0) {
+            return null;
+        }
+        try {
+            return Capsule::table('tblinvoices')->where('id', $invoiceId)->first(['id', 'userid', 'total', 'status', 'duedate']) ?: null;
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    /** Sum of (amountin - amountout) already recorded against an invoice. */
+    public static function getInvoicePaid(int $invoiceId): float
+    {
+        try {
+            $row = Capsule::table('tblaccounts')
+                ->where('invoiceid', $invoiceId)
+                ->selectRaw('COALESCE(SUM(amountin), 0) AS paid_in, COALESCE(SUM(amountout), 0) AS paid_out')
+                ->first();
+            return $row ? round((float) $row->paid_in - (float) $row->paid_out, 2) : 0.0;
+        } catch (\Throwable $e) {
+            return 0.0;
+        }
+    }
+
+    /**
+     * Outstanding balance in the invoice's own currency. WHMCS has no
+     * `balance` column on tblinvoices (the Invoice model computes it the
+     * same way), which is why the v3.2 partial-payment features never
+     * worked: every query against `balance` threw and was swallowed.
+     */
+    public static function getInvoiceBalance(int $invoiceId): ?float
+    {
+        $invoice = self::getInvoice($invoiceId);
+        if (!$invoice) {
+            return null;
+        }
+        return round((float) $invoice->total - self::getInvoicePaid($invoiceId), 2);
+    }
+
+    /** @return object|null {id, code, prefix, rate} */
+    public static function getCurrencyByCode(string $code): ?object
+    {
+        try {
+            return Capsule::table('tblcurrencies')->where('code', strtoupper($code))->first(['id', 'code', 'prefix', 'rate']) ?: null;
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    /** The currency an invoice is billed in (the client's currency). */
+    public static function getInvoiceCurrency(int $invoiceId): ?object
+    {
+        try {
+            $invoice = self::getInvoice($invoiceId);
+            if (!$invoice) {
+                return null;
+            }
+            $client = Capsule::table('tblclients')->where('id', $invoice->userid)->first(['currency']);
+            if (!$client) {
+                return null;
+            }
+            return Capsule::table('tblcurrencies')->where('id', $client->currency)->first(['id', 'code', 'prefix', 'rate']) ?: null;
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    /**
+     * Convert between two WHMCS currencies using their configured rates
+     * (rates are relative to the WHMCS default currency, whose rate is 1).
+     */
+    public static function convertAmount(float $amount, ?object $from, ?object $to): float
+    {
+        if (!$from || !$to || (int) $from->id === (int) $to->id) {
+            return $amount;
+        }
+        $fromRate = (float) $from->rate;
+        $toRate   = (float) $to->rate;
+        if ($fromRate <= 0 || $toRate <= 0) {
+            return $amount;
+        }
+        return round($amount / $fromRate * $toRate, 2);
+    }
+
+    /** M-Pesa always settles in KES; convert a KES amount into the invoice's currency. */
+    public static function kesToInvoiceCurrency(int $invoiceId, float $kes): float
+    {
+        $invoiceCurrency = self::getInvoiceCurrency($invoiceId);
+        if (!$invoiceCurrency || strtoupper((string) $invoiceCurrency->code) === 'KES') {
+            return $kes;
+        }
+        $kesCurrency = self::getCurrencyByCode('KES');
+        return $kesCurrency ? self::convertAmount($kes, $kesCurrency, $invoiceCurrency) : $kes;
+    }
+
+    /**
+     * KES amount due for an invoice, rounded UP to a whole shilling (M-Pesa
+     * only moves whole shillings). Returns null if the invoice's currency
+     * isn't KES and no KES currency/rate is configured in WHMCS.
+     */
+    public static function invoiceBalanceInKes(int $invoiceId): ?int
+    {
+        $balance = self::getInvoiceBalance($invoiceId);
+        if ($balance === null) {
+            return null;
+        }
+
+        $invoiceCurrency = self::getInvoiceCurrency($invoiceId);
+        if ($invoiceCurrency && strtoupper((string) $invoiceCurrency->code) !== 'KES') {
+            $kesCurrency = self::getCurrencyByCode('KES');
+            if (!$kesCurrency) {
+                return null;
+            }
+            $balance = self::convertAmount($balance, $invoiceCurrency, $kesCurrency);
+        }
+
+        // Guard against float noise (e.g. 100.0000001 → 101).
+        return (int) ceil(round($balance, 2) - 0.001);
+    }
+
+    /** Would WHMCS's own checkCbTransID() consider this a duplicate? (without its die()) */
+    public static function transIdExists(string $transId): bool
+    {
+        if ($transId === '') {
+            return false;
+        }
+        try {
+            return Capsule::table('tblaccounts')->where('transid', $transId)->exists();
+        } catch (\Throwable $e) {
+            return true; // fail safe: never risk a double credit
+        }
+    }
+
+    /**
+     * The single path through which FlexPay puts money on a WHMCS invoice.
      *
-     * IMPORTANT: WHMCS itself has no "Partially Paid" invoice status —
-     * an underpaid invoice simply stays Unpaid/Overdue with a reduced
-     * balance (see WHMCS\Billing\Invoice — status is one of unpaid,
-     * overdue, paid, cancelled, refunded, collections; nothing else).
-     * This classifier doesn't fight that model or invent a new status;
-     * it's purely an observation layer for FlexPay's own messaging and
-     * dashboard display, read from the invoice's real `total`/`balance`
-     * fields (the same fields WHMCS's own API exposes).
+     * Replaces the old checkCbInvoiceID() → checkCbTransID() →
+     * addInvoicePayment() sequence. Both of those WHMCS helpers call die()
+     * on failure, which inside a Daraja callback killed the request with no
+     * JSON response, and inside the admin dashboard blanked the page. They
+     * could never reach the surrounding try/catch.
      *
-     * Overpayment handling itself needs NO special code here — WHMCS's
-     * addInvoicePayment() already creates the credit note and credits
-     * the client's account balance automatically the moment the paid
-     * amount exceeds the remaining balance (see WHMCS's own Billing
-     * Logic documentation: "Creates a credit note... Credits the
-     * difference between the balance and the transaction amount to the
-     * client's account... Changes the credit description format to
-     * Invoice # Overpayment."). This method's job is only to detect that
-     * it happened, so FlexPay can say so clearly instead of leaving it
-     * as a silent side effect.
+     * @param  int         $invoiceId
+     * @param  string      $transId        Ledger transaction ID (receipt, or CheckoutRequestID when the receipt isn't known yet)
+     * @param  float       $kesAmount      Amount actually received, in KES
+     * @param  string[]|null $allowedStatuses  Invoice statuses allowed (null = any status except Cancelled)
+     * @return array ['applied' => bool, 'reason' => string, 'message' => string, 'outcome' => array|null, 'invoice_id' => int]
+     */
+    public static function applyPaymentToInvoice(int $invoiceId, string $transId, float $kesAmount, ?array $allowedStatuses = null): array
+    {
+        $fail = function (string $reason, string $message) use ($invoiceId) {
+            return ['applied' => false, 'reason' => $reason, 'message' => $message, 'outcome' => null, 'invoice_id' => $invoiceId];
+        };
+
+        if ($kesAmount <= 0) {
+            return $fail('invalid_amount', 'Payment amount must be greater than zero.');
+        }
+
+        $invoice = self::getInvoice($invoiceId);
+        if (!$invoice) {
+            return $fail('invoice_not_found', "Invoice #{$invoiceId} does not exist.");
+        }
+
+        if ($allowedStatuses !== null ? !in_array($invoice->status, $allowedStatuses, true) : $invoice->status === 'Cancelled') {
+            return $fail('invoice_status', "Invoice #{$invoiceId} is {$invoice->status} — payment not auto-applied.");
+        }
+
+        if (self::transIdExists($transId)) {
+            return $fail('duplicate', "Transaction {$transId} has already been recorded in WHMCS.");
+        }
+
+        self::ensureInvoiceFunctionsLoaded();
+        if (!function_exists('addInvoicePayment')) {
+            return $fail('whmcs_unavailable', 'WHMCS invoice functions could not be loaded.');
+        }
+
+        $amount = self::kesToInvoiceCurrency($invoiceId, $kesAmount);
+
+        try {
+            addInvoicePayment($invoiceId, $transId, $amount, 0, self::GATEWAY);
+        } catch (\Throwable $e) {
+            return $fail('whmcs_error', 'WHMCS rejected the payment: ' . $e->getMessage());
+        }
+
+        $outcome = self::classifyPaymentOutcome($invoiceId, $amount);
+
+        return ['applied' => true, 'reason' => 'applied', 'message' => $outcome['message'], 'outcome' => $outcome, 'invoice_id' => $invoiceId];
+    }
+
+    /**
+     * Classify the result of a payment just applied to an invoice: exact,
+     * partial, or overpaid. Observational only — WHMCS itself already
+     * credited any overpayment to the client (addInvoicePayment does that).
      *
-     * @param  int   $invoiceId      The invoice the payment was just applied to
-     * @param  float $amountPaid     The exact amount that was just applied
-     * @return array  [
-     *   'outcome'         => 'exact'|'partial'|'overpaid'|'unknown',
-     *   'invoice_total'   => float|null,
-     *   'balance_before'  => float|null,
-     *   'balance_after'   => float|null,
-     *   'remaining'       => float,   // 0 if fully paid or overpaid
-     *   'credited'        => float,   // amount sent to client credit balance, 0 if none
-     *   'message'         => string,  // human-readable, customer-safe
-     * ]
+     * @param  int   $invoiceId
+     * @param  float $amountPaid  Amount just applied, in the invoice's currency
      */
     public static function classifyPaymentOutcome(int $invoiceId, float $amountPaid): array
     {
@@ -331,412 +684,672 @@ class FlexPayStore
             'message'        => 'Payment applied.',
         ];
 
+        $invoice = self::getInvoice($invoiceId);
+        if (!$invoice) {
+            return $result;
+        }
+
+        $currency = self::getInvoiceCurrency($invoiceId);
+        $code     = $currency ? strtoupper((string) $currency->code) : 'KES';
+        $fmt      = function (float $v) use ($code) {
+            return $code . ' ' . number_format($v, 2);
+        };
+
+        $total = (float) $invoice->total;
+        // After an overpayment WHMCS adds the excess to client credit with a
+        // matching amountout row, so paid never exceeds total here.
+        $balanceAfter  = max(0.0, round($total - self::getInvoicePaid($invoiceId), 2));
+        $balanceBefore = min($total, round($balanceAfter + $amountPaid, 2));
+
+        $result['invoice_total']  = $total;
+        $result['balance_before'] = $balanceBefore;
+        $result['balance_after']  = $balanceAfter;
+
+        if ($balanceAfter > 0.009) {
+            $result['outcome']   = 'partial';
+            $result['remaining'] = $balanceAfter;
+            $result['message']   = sprintf('%s received and applied. %s still due on this invoice.', $fmt($amountPaid), $fmt($balanceAfter));
+        } elseif ($amountPaid > $balanceBefore + 0.009) {
+            $overage = round($amountPaid - $balanceBefore, 2);
+            $result['outcome']  = 'overpaid';
+            $result['credited'] = $overage;
+            $result['message']  = sprintf(
+                '%s received. %s applied to this invoice and %s credited to your account balance for future use.',
+                $fmt($amountPaid), $fmt($balanceBefore), $fmt($overage)
+            );
+        } else {
+            $result['outcome'] = 'exact';
+            $result['message'] = sprintf('%s received and this invoice is now fully paid.', $fmt($amountPaid));
+        }
+
+        return $result;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // STK settlement
+    // ─────────────────────────────────────────────────────────────────────
+
+    /**
+     * Settle a successful STK Push exactly once, whichever path confirmed
+     * it first: the Daraja callback, the invoice-page poller's live query,
+     * or the cron sweeper.
+     *
+     * Only call this AFTER success has been independently confirmed
+     * (authenticated callback and/or a Daraja STK query returning 0).
+     *
+     * Exactly-once: the pending row is claimed with a conditional UPDATE
+     * (WHERE status IN ('pending','failed')), so concurrent callers can't
+     * both apply the payment. The amount applied is the amount WE asked
+     * Safaricom to collect (stored when the push was created) — never an
+     * amount taken from the request that reported success.
+     *
+     * When the receipt isn't known yet (Daraja's STK query doesn't return
+     * it), the CheckoutRequestID is used as the WHMCS transaction ID; when
+     * the callback later delivers the receipt, attachReceiptToStk() swaps it
+     * in on both our row and the WHMCS ledger entry.
+     *
+     * @return array ['applied' => bool, 'already_settled' => bool, 'invoice_id' => int|null, 'message' => string]
+     */
+    public static function settleStk(string $checkoutId, ?string $receipt, string $source, ?string $phone = null, ?float $reportedAmount = null): array
+    {
+        self::ensureTables();
+
+        $receipt = ($receipt !== null && $receipt !== '') ? $receipt : null;
+        $row     = self::findTransactionByCheckoutId($checkoutId);
+
+        if (!$row) {
+            // Daraja confirmed a push we have no record of (e.g. created by an
+            // older version). Record it for the Reconciliation queue — never
+            // guess an invoice.
+            if ($receipt) {
+                self::insertTransactionOnce([
+                    'channel' => 'stk', 'direction' => 'in', 'checkout_request_id' => $checkoutId,
+                    'mpesa_receipt' => $receipt, 'phone' => (string) $phone, 'amount' => (float) $reportedAmount,
+                    'status' => 'success', 'result_code' => '0',
+                    'result_desc' => 'Confirmed STK payment with no matching request on file — needs manual reconciliation.',
+                ]);
+                self::storeUnmatched([
+                    'trans_id' => $receipt, 'amount' => (float) $reportedAmount, 'phone' => (string) $phone,
+                    'bill_ref' => '(STK ' . $checkoutId . ')', 'notes' => 'STK payment with no request on file.',
+                ]);
+            }
+            return ['applied' => false, 'already_settled' => false, 'invoice_id' => null, 'message' => 'No request on file for this checkout ID.'];
+        }
+
+        if ($row->status === 'success') {
+            if ($receipt) {
+                self::attachReceiptToStk($row, $receipt);
+            }
+            return [
+                'applied' => false, 'already_settled' => true,
+                'invoice_id' => $row->invoice_id ? (int) $row->invoice_id : null,
+                'message' => $row->result_desc ?: 'Already settled — no action taken.',
+            ];
+        }
+
+        // ── Atomic claim ──────────────────────────────────────────────────
+        $claim = ['status' => 'success', 'result_code' => '0', 'updated_at' => self::now()];
+        if ($receipt) {
+            $claim['mpesa_receipt'] = $receipt;
+        }
+        if ($phone) {
+            $claim['phone'] = substr($phone, 0, 64);
+        }
+
         try {
-            // Read the CURRENT (post-payment) state — addInvoicePayment()
-            // has already run by the time this is called, so `balance`
-            // here reflects after-payment. We reconstruct the before-state
-            // by adding back the amount that was just paid (capped at the
-            // total, since WHMCS never lets balance exceed total).
-            $invoice = Capsule::table('tblinvoices')->where('id', $invoiceId)->first(['total', 'balance', 'status']);
+            $claimed = Capsule::table('flexpay_transactions')
+                ->where('id', $row->id)
+                ->whereIn('status', ['pending', 'failed'])
+                ->update($claim);
+        } catch (\Throwable $e) {
+            // Most likely the receipt is already on another row (duplicate
+            // callback that lost the race) — treat as already handled.
+            $claimed = 0;
+        }
 
-            if (!$invoice) {
-                return $result;
+        if ($claimed !== 1) {
+            $fresh = self::findTransactionByCheckoutId($checkoutId);
+            return [
+                'applied' => false, 'already_settled' => true,
+                'invoice_id' => ($fresh && $fresh->invoice_id) ? (int) $fresh->invoice_id : null,
+                'message' => ($fresh && $fresh->result_desc) ? $fresh->result_desc : 'Already settled — no action taken.',
+            ];
+        }
+
+        $invoiceId = $row->invoice_id ? (int) $row->invoice_id : 0;
+        $amount    = (float) $row->amount;
+        $transId   = $receipt ?: $checkoutId;
+
+        if ($reportedAmount !== null && $reportedAmount > 0 && abs($reportedAmount - $amount) > 0.009) {
+            self::logApiCall('stk_amount_mismatch', ['checkout_request_id' => $checkoutId], ['requested' => $amount, 'reported' => $reportedAmount], false, $source);
+        }
+
+        $apply = $invoiceId
+            ? self::applyPaymentToInvoice($invoiceId, $transId, $amount)
+            : ['applied' => false, 'reason' => 'no_invoice', 'message' => 'No invoice linked to this request.', 'outcome' => null];
+
+        $desc = $apply['applied']
+            ? $apply['message']
+            : ('Paid, but not applied automatically: ' . $apply['message']);
+        if ($source !== 'callback') {
+            $desc .= " [settled via {$source}]";
+        }
+
+        Capsule::table('flexpay_transactions')->where('id', $row->id)->update([
+            'result_desc'     => substr($desc, 0, 255),
+            'payment_outcome' => $apply['outcome']['outcome'] ?? null,
+            'updated_at'      => self::now(),
+        ]);
+
+        if (!$apply['applied'] && $apply['reason'] !== 'duplicate') {
+            self::storeUnmatched([
+                'trans_id'             => $transId,
+                'amount'               => $amount,
+                'phone'                => (string) ($phone ?: $row->phone),
+                'bill_ref'             => (string) $row->account_reference,
+                'notes'                => substr('STK payment not auto-applied: ' . $apply['message'], 0, 255),
+                'suggested_invoice_id' => $invoiceId ?: null,
+            ]);
+        }
+
+        self::logApiCall(
+            'stk_settlement',
+            ['checkout_request_id' => $checkoutId, 'receipt' => $receipt, 'amount' => $amount, 'source' => $source],
+            ['invoice_id' => $invoiceId ?: null, 'applied' => $apply['applied'], 'message' => $apply['message']],
+            $apply['applied'],
+            $source
+        );
+
+        return [
+            'applied'         => $apply['applied'],
+            'already_settled' => false,
+            'invoice_id'      => $apply['applied'] ? $invoiceId : null,
+            'message'         => $apply['applied'] ? $apply['message'] : $desc,
+            'outcome'         => $apply['outcome'] ?? null,
+        ];
+    }
+
+    /**
+     * When an STK payment was settled before its receipt was known (using the
+     * CheckoutRequestID as the WHMCS transaction ID), record the real receipt
+     * on our row and on the WHMCS ledger entry so refunds and searches work.
+     */
+    public static function attachReceiptToStk(object $row, string $receipt): void
+    {
+        if (!empty($row->mpesa_receipt) || $receipt === '') {
+            return;
+        }
+        try {
+            Capsule::table('flexpay_transactions')->where('id', $row->id)->update(['mpesa_receipt' => $receipt, 'updated_at' => self::now()]);
+            Capsule::table('tblaccounts')
+                ->where('transid', (string) $row->checkout_request_id)
+                ->where('gateway', self::GATEWAY)
+                ->update(['transid' => $receipt]);
+        } catch (\Throwable $e) {
+            self::activity('could not attach receipt ' . $receipt . ' — ' . $e->getMessage());
+        }
+    }
+
+    /** Record an STK failure without ever downgrading a settled payment. */
+    public static function markStkFailed(string $checkoutId, string $resultCode, string $resultDesc, ?string $raw = null): void
+    {
+        self::ensureTables();
+        try {
+            $data = [
+                'status'      => 'failed',
+                'result_code' => substr($resultCode, 0, 20),
+                'result_desc' => substr($resultDesc, 0, 255),
+                'updated_at'  => self::now(),
+            ];
+            if ($raw !== null) {
+                $data['raw_response'] = $raw;
             }
-
-            $total        = (float) $invoice->total;
-            $balanceAfter = (float) $invoice->balance;
-            $balanceBefore = min($total, $balanceAfter + $amountPaid);
-
-            $result['invoice_total']  = $total;
-            $result['balance_before'] = $balanceBefore;
-            $result['balance_after']  = $balanceAfter;
-
-            if ($balanceAfter > 0.009) {
-                // Still owing after this payment — a partial/underpayment.
-                $result['outcome']   = 'partial';
-                $result['remaining'] = round($balanceAfter, 2);
-                $result['message']   = sprintf(
-                    'KES %s received and applied. KES %s still due on this invoice.',
-                    number_format($amountPaid, 2),
-                    number_format($balanceAfter, 2)
-                );
-            } elseif ($amountPaid > $balanceBefore + 0.009) {
-                // Paid more than was owed — WHMCS already auto-created the
-                // credit note and credited the client; we just describe it.
-                $overage = round($amountPaid - $balanceBefore, 2);
-                $result['outcome']  = 'overpaid';
-                $result['credited'] = $overage;
-                $result['message']  = sprintf(
-                    'KES %s received. KES %s applied to this invoice and KES %s credited to your account balance for future use.',
-                    number_format($amountPaid, 2),
-                    number_format($balanceBefore, 2),
-                    number_format($overage, 2)
-                );
-            } else {
-                $result['outcome'] = 'exact';
-                $result['message'] = sprintf('KES %s received and this invoice is now fully paid.', number_format($amountPaid, 2));
-            }
-
-            return $result;
-        } catch (\Exception $e) {
-            return $result;
+            Capsule::table('flexpay_transactions')
+                ->where('checkout_request_id', $checkoutId)
+                ->where('status', 'pending')
+                ->update($data);
+        } catch (\Throwable $e) {
+            self::activity('markStkFailed failed — ' . $e->getMessage());
         }
     }
 
     /**
-     * Settle a successful STK Push payment exactly once, regardless of
-     * WHICH path discovered the success first — the real-time Daraja
-     * callback, or the self-healing live-query fallback in poll.php for
-     * cases where the callback was delayed, dropped, or never arrived
-     * (a known reliability gap in Safaricom's sandbox, and occasionally
-     * production too).
+     * Safaricom also sends a C2B confirmation for STK payments made to a
+     * paybill/till. Find the STK push a C2B confirmation belongs to, so the
+     * money is applied once (with the real receipt), not twice.
      *
-     * This is "intelligent" in the sense your invoice always gets linked
-     * the same way regardless of Till (Buy Goods) vs Paybill: we never
-     * depend on Safaricom echoing back our AccountReference (which Till
-     * transactions don't reliably support per Daraja's own docs) — the
-     * link to the invoice is established the moment WE create the STK
-     * request (checkout.php writes invoice_id against checkout_request_id
-     * BEFORE the customer even sees the prompt), so settlement only ever
-     * needs the CheckoutRequestID to find its way back to the right
-     * invoice, which works identically for both shortcode types.
-     *
-     * Idempotent: if this checkout_request_id has already been marked
-     * successful (e.g. the real callback got there first), calling this
-     * again is a safe no-op — it will NOT call addInvoicePayment() twice
-     * for the same payment. WHMCS's own checkCbTransID() also guards
-     * against double-crediting the same M-Pesa receipt as a second line
-     * of defense.
-     *
-     * @param  string      $checkoutId
-     * @param  string      $receipt       M-Pesa receipt number
-     * @param  float       $amount
-     * @param  string      $phone
-     * @param  string      $resultDesc
-     * @param  string      $gatewayModuleName
-     * @param  string      $source        'callback' or 'live_query_self_heal' — for logging only
-     * @return array       ['applied' => bool, 'already_settled' => bool, 'invoice_id' => int|null, 'message' => string]
+     * Matches a recent STK row for the same amount that is still pending, or
+     * was settled before its receipt was known, whose account reference or
+     * phone matches the C2B payload.
      */
-    public static function settleStkSuccess(
-        string $checkoutId,
-        string $receipt,
-        float $amount,
-        string $phone,
-        string $resultDesc,
-        string $gatewayModuleName,
-        string $source = 'callback'
-    ): array {
+    public static function findStkForC2B(float $amount, string $billRef, string $msisdn, int $windowSeconds = 900): ?object
+    {
         self::ensureTables();
-
         try {
-            $existing = Capsule::table('flexpay_transactions')
-                ->where('checkout_request_id', $checkoutId)
-                ->first();
+            $rows = Capsule::table('flexpay_transactions')
+                ->where('channel', 'stk')
+                ->whereNotNull('checkout_request_id')
+                ->whereNull('mpesa_receipt')
+                ->whereIn('status', ['pending', 'success', 'failed'])
+                ->where('created_at', '>=', date('Y-m-d H:i:s', time() - $windowSeconds))
+                ->whereBetween('amount', [$amount - 0.009, $amount + 0.009])
+                ->orderBy('created_at', 'desc')
+                ->take(10)
+                ->get();
+        } catch (\Throwable $e) {
+            return null;
+        }
 
-            // Already settled by a previous call (callback got there first,
-            // or this is a duplicate/retried Daraja callback) — do nothing.
-            if ($existing && $existing->status === 'success') {
-                return [
-                    'applied'          => false,
-                    'already_settled'  => true,
-                    'invoice_id'       => $existing->invoice_id ? (int) $existing->invoice_id : null,
-                    'message'          => 'Already settled — no action taken.',
-                ];
+        $billRef = strtoupper(trim($billRef));
+        foreach ($rows as $row) {
+            $refMatch   = $billRef !== '' && strtoupper((string) $row->account_reference) === $billRef;
+            $phoneMatch = $msisdn !== '' && self::phoneMatches((string) $row->phone, $msisdn);
+            if ($refMatch || $phoneMatch) {
+                return $row;
             }
+        }
+        return null;
+    }
 
-            $invoiceId = $existing ? (int) $existing->invoice_id : null;
-            $appliedInvoiceId = null;
-            $applyMessage = 'No invoice link found for this checkout request — payment recorded but not auto-applied.';
-            $outcome = null;
+    public static function deleteTransaction(int $id): void
+    {
+        try {
+            Capsule::table('flexpay_transactions')->where('id', $id)->delete();
+        } catch (\Throwable $e) {
+            // non-fatal
+        }
+    }
 
-            if ($invoiceId) {
+    public static function updateTransaction(int $id, array $data): void
+    {
+        $data = self::normalizeIdentifiers($data);
+        $data['updated_at'] = self::now();
+        try {
+            Capsule::table('flexpay_transactions')->where('id', $id)->update($data);
+        } catch (\Throwable $e) {
+            self::activity('updateTransaction failed — ' . $e->getMessage());
+        }
+    }
+
+    public static function touchChecked(int $rowId): void
+    {
+        try {
+            Capsule::table('flexpay_transactions')->where('id', $rowId)->update(['last_checked_at' => self::now()]);
+        } catch (\Throwable $e) {
+            // non-fatal
+        }
+    }
+
+    /** Pending STK rows due for a live status check (cron sweeper). */
+    public static function listStalePendingStk(int $olderThanSeconds, int $recheckAfterSeconds, int $limit): array
+    {
+        self::ensureTables();
+        try {
+            return self::rows(Capsule::table('flexpay_transactions')
+                ->where('channel', 'stk')
+                ->where('status', 'pending')
+                ->whereNotNull('checkout_request_id')
+                ->where('created_at', '<=', date('Y-m-d H:i:s', time() - $olderThanSeconds))
+                ->where(function ($q) use ($recheckAfterSeconds) {
+                    $q->whereNull('last_checked_at')
+                      ->orWhere('last_checked_at', '<=', date('Y-m-d H:i:s', time() - $recheckAfterSeconds));
+                })
+                ->orderBy('created_at', 'asc')
+                ->take($limit)
+                ->get());
+        } catch (\Throwable $e) {
+            return [];
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // C2B matching
+    // ─────────────────────────────────────────────────────────────────────
+
+    /**
+     * Extract an invoice number from a customer-typed account reference:
+     *   "INV-42", "INV42", "inv 42", "42", "0000042", "INV-42-A" → 42
+     *
+     * Deliberately refuses to guess when the reference contains several
+     * unrelated numbers without the configured prefix ("ACC 2 PLAN 7"), or a
+     * number too long to be an invoice ID (a phone number, say).
+     */
+    public static function parseInvoiceRef(string $ref, string $prefix = 'INV'): ?int
+    {
+        $ref = trim($ref);
+        if ($ref === '') {
+            return null;
+        }
+
+        $prefix = trim($prefix);
+        if ($prefix !== '' && preg_match('/' . preg_quote($prefix, '/') . '[\s\-_#:.\/]*0*(\d{1,10})/i', $ref, $m)) {
+            $num = (int) $m[1];
+            return $num > 0 ? $num : null;
+        }
+
+        if (preg_match_all('/\d+/', $ref, $m) && count($m[0]) === 1) {
+            // A phone number typed as the account number is not an invoice ID.
+            if (strlen($m[0][0]) >= 9 && DarajaClient::formatPhone($m[0][0]) !== '') {
+                return null;
+            }
+            $digits = ltrim($m[0][0], '0');
+            if ($digits !== '' && strlen($digits) <= 9) {
+                return (int) $digits;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Open invoices with their outstanding balance converted to KES.
+     *
+     * @return array<int, array{id:int, userid:int, balance_kes:float, duedate:string, phone:string}>
+     */
+    public static function listOpenInvoicesWithBalance(int $limit = 1000): array
+    {
+        try {
+            $rows = Capsule::table('tblinvoices as i')
+                ->leftJoin('tblclients as c', 'c.id', '=', 'i.userid')
+                ->whereIn('i.status', self::OPEN_INVOICE_STATUSES)
+                ->select('i.id', 'i.userid', 'i.total', 'i.duedate', 'c.currency', 'c.phonenumber')
+                ->selectRaw('(i.total - COALESCE((SELECT SUM(a.amountin - a.amountout) FROM tblaccounts a WHERE a.invoiceid = i.id), 0)) AS fp_balance')
+                ->orderBy('i.duedate', 'desc')
+                ->take($limit)
+                ->get();
+        } catch (\Throwable $e) {
+            return [];
+        }
+
+        $kes        = self::getCurrencyByCode('KES');
+        $currencies = [];
+        $out        = [];
+
+        foreach ($rows as $r) {
+            $balance = round((float) $r->fp_balance, 2);
+            if ($balance <= 0.009) {
+                continue;
+            }
+            $cid = (int) $r->currency;
+            if (!array_key_exists($cid, $currencies)) {
                 try {
-                    $normalizedInvoiceId = checkCbInvoiceID($invoiceId, $gatewayModuleName);
-                    checkCbTransID($receipt);
-                    addInvoicePayment($normalizedInvoiceId, $receipt, $amount, 0, $gatewayModuleName);
-                    $appliedInvoiceId = $normalizedInvoiceId;
-
-                    $outcome = self::classifyPaymentOutcome($normalizedInvoiceId, $amount);
-                    $applyMessage = $outcome['message'];
+                    $currencies[$cid] = Capsule::table('tblcurrencies')->where('id', $cid)->first(['id', 'code', 'prefix', 'rate']);
                 } catch (\Throwable $e) {
-                    // checkCbTransID may legitimately die()/throw on a true
-                    // duplicate receipt — that means another path already
-                    // credited it, which is the safe outcome, not a failure.
-                    $applyMessage = 'Invoice application skipped: ' . $e->getMessage();
+                    $currencies[$cid] = null;
                 }
             }
-
-            self::recordTransaction([
-                'channel'             => 'stk',
-                'direction'           => 'in',
-                'invoice_id'          => $invoiceId,
-                'checkout_request_id' => $checkoutId,
-                'mpesa_receipt'       => $receipt,
-                'phone'               => $phone,
-                'amount'              => $amount,
-                'status'              => 'success',
-                'result_code'         => '0',
-                'result_desc'         => ($outcome['message'] ?? $resultDesc) . ($source !== 'callback' ? " [settled via {$source}]" : ''),
-                'payment_outcome'     => $outcome['outcome'] ?? null,
-            ]);
-
-            FlexPayStore::logApiCall(
-                'stk_settlement',
-                ['checkout_request_id' => $checkoutId, 'receipt' => $receipt, 'amount' => $amount, 'source' => $source],
-                ['invoice_id' => $invoiceId, 'applied_invoice_id' => $appliedInvoiceId, 'message' => $applyMessage, 'outcome' => $outcome['outcome'] ?? null],
-                $appliedInvoiceId !== null,
-                $source
-            );
-
-            return [
-                'applied'         => $appliedInvoiceId !== null,
-                'already_settled' => false,
-                'invoice_id'      => $appliedInvoiceId,
-                'message'         => $applyMessage,
-                'outcome'         => $outcome,
+            $cur = $currencies[$cid];
+            if ($cur && strtoupper((string) $cur->code) !== 'KES') {
+                $balance = $kes ? self::convertAmount($balance, $cur, $kes) : -1.0; // -1: can't compare
+            }
+            $out[] = [
+                'id'          => (int) $r->id,
+                'userid'      => (int) $r->userid,
+                'balance_kes' => $balance,
+                'duedate'     => (string) $r->duedate,
+                'phone'       => (string) $r->phonenumber,
             ];
-        } catch (\Throwable $e) {
-            return ['applied' => false, 'already_settled' => false, 'invoice_id' => null, 'message' => 'Settlement error: ' . $e->getMessage()];
         }
+
+        return $out;
     }
 
     /**
-     * Fetch a paginated, optionally-filtered list of transactions for the
-     * dashboard's main transaction table.
-     *
-     * @param  array $filters  channel, status, search (phone/receipt/ref), date_from, date_to
-     * @param  int   $page
-     * @param  int   $perPage
-     * @return array  ['data' => [...], 'total' => int]
+     * Does a Daraja-reported MSISDN match a client's stored phone number?
+     * Handles full numbers, masked ones ("2547******123") and the SHA-256
+     * hashed MSISDN that C2B v2 callbacks carry.
      */
-    public static function listTransactions(array $filters = [], int $page = 1, int $perPage = 25): array
+    public static function phoneMatches(string $clientPhone, string $observed): bool
     {
-        self::ensureTables();
-
-        try {
-            $query = Capsule::table('flexpay_transactions');
-
-            if (!empty($filters['channel'])) {
-                $query->where('channel', $filters['channel']);
-            }
-            if (!empty($filters['status'])) {
-                $query->where('status', $filters['status']);
-            }
-            if (!empty($filters['search'])) {
-                $term = $filters['search'];
-                $query->where(function ($q) use ($term) {
-                    $q->where('mpesa_receipt', 'like', "%{$term}%")
-                      ->orWhere('phone', 'like', "%{$term}%")
-                      ->orWhere('account_reference', 'like', "%{$term}%");
-                });
-            }
-            if (!empty($filters['date_from'])) {
-                $query->where('created_at', '>=', $filters['date_from'] . ' 00:00:00');
-            }
-            if (!empty($filters['date_to'])) {
-                $query->where('created_at', '<=', $filters['date_to'] . ' 23:59:59');
-            }
-
-            $total = $query->count();
-
-            $data = $query->orderBy('created_at', 'desc')
-                ->skip(($page - 1) * $perPage)
-                ->take($perPage)
-                ->get();
-
-            return ['data' => $data, 'total' => $total];
-        } catch (\Exception $e) {
-            return ['data' => [], 'total' => 0];
+        $full = DarajaClient::formatPhone($clientPhone);
+        if ($full === '') {
+            return false;
         }
+
+        $observed = trim(explode(' - ', $observed)[0]);
+        if ($observed === '') {
+            return false;
+        }
+
+        if (preg_match('/^[a-f0-9]{64}$/i', $observed)) {
+            return hash_equals(strtolower($observed), hash('sha256', $full));
+        }
+
+        $o = preg_replace('/[^0-9*]/', '', $observed);
+        if (strlen($o) === 10 && $o[0] === '0') {
+            $o = '254' . substr($o, 1);
+        } elseif (strlen($o) === 9) {
+            $o = '254' . $o;
+        }
+        if (strlen($o) !== 12 || strlen(str_replace('*', '', $o)) < 6) {
+            return false;
+        }
+
+        return (bool) preg_match('/^' . str_replace('*', '\d', $o) . '$/', $full);
     }
 
     /**
-     * Aggregate stats for the dashboard summary cards + admin widget.
+     * Decide which invoice (if any) a C2B payment belongs to.
      *
-     * @param  int $days  Lookback window
-     * @return array
+     * 1. Account reference → invoice number (paybill payments).
+     * 2. Payer's phone matches exactly one open invoice for this amount
+     *    (works for Till payments, which carry no reference).
+     * 3. Optional: amount matches exactly one open invoice (disambiguated by
+     *    due date); off by default since v3.5 because it can credit the wrong
+     *    customer when an unrelated payment happens to share an amount.
+     *
+     * Never guesses on ambiguity; unresolved payments go to Reconciliation.
+     *
+     * @return array ['invoice_id' => ?int, 'method' => string, 'note' => string, 'suggested' => ?int]
      */
-    public static function getStats(int $days = 30): array
+    public static function matchC2BInvoice(float $amountKes, string $billRef, string $msisdn, string $transTime, array $gw): array
     {
-        self::ensureTables();
+        $none = ['invoice_id' => null, 'method' => 'none', 'note' => '', 'suggested' => null];
 
-        $since = date('Y-m-d H:i:s', strtotime("-{$days} days"));
+        $billRef = trim($billRef);
+        $billRefUsable = $billRef !== '' && !preg_match('/^0+$/', $billRef);
 
-        try {
-            $base = Capsule::table('flexpay_transactions')->where('created_at', '>=', $since);
-
-            $totalIn = (clone $base)->where('direction', 'in')->where('status', 'success')->sum('amount');
-            $totalOut = (clone $base)->where('direction', 'out')->where('status', 'success')->sum('amount');
-            $successCount = (clone $base)->where('status', 'success')->count();
-            $failedCount  = (clone $base)->where('status', 'failed')->count();
-            $pendingCount = (clone $base)->where('status', 'pending')->count();
-
-            $stkCount = (clone $base)->where('channel', 'stk')->where('status', 'success')->count();
-            $c2bCount = (clone $base)->where('channel', 'c2b')->where('status', 'success')->count();
-
-            $unmatchedCount = Capsule::table('flexpay_unmatched_payments')->where('matched', 0)->count();
-
-            return [
-                'total_in'        => (float) $totalIn,
-                'total_out'       => (float) $totalOut,
-                'success_count'   => (int) $successCount,
-                'failed_count'    => (int) $failedCount,
-                'pending_count'   => (int) $pendingCount,
-                'stk_count'       => (int) $stkCount,
-                'c2b_count'       => (int) $c2bCount,
-                'unmatched_count' => (int) $unmatchedCount,
-                'period_days'     => $days,
-            ];
-        } catch (\Exception $e) {
-            return [
-                'total_in' => 0, 'total_out' => 0, 'success_count' => 0,
-                'failed_count' => 0, 'pending_count' => 0, 'stk_count' => 0,
-                'c2b_count' => 0, 'unmatched_count' => 0, 'period_days' => $days,
-            ];
+        if ($billRefUsable) {
+            $parsed = self::parseInvoiceRef($billRef, (string) ($gw['accountRefPrefix'] ?? 'INV'));
+            if ($parsed !== null) {
+                $invoice = self::getInvoice($parsed);
+                if ($invoice && in_array($invoice->status, self::OPEN_INVOICE_STATUSES, true)) {
+                    return ['invoice_id' => $parsed, 'method' => 'account_reference', 'note' => '', 'suggested' => null];
+                }
+                if ($invoice) {
+                    $none['note']      = "Reference points to Invoice #{$parsed}, which is {$invoice->status}.";
+                    $none['suggested'] = $parsed;
+                } else {
+                    $none['note'] = "Reference \"{$billRef}\" does not match any invoice.";
+                }
+            }
         }
+
+        $open = null;
+
+        if (($gw['c2bPhoneMatching'] ?? 'on') === 'on' && $msisdn !== '') {
+            $open = self::listOpenInvoicesWithBalance();
+            $hits = array_values(array_filter($open, function ($inv) use ($amountKes, $msisdn) {
+                return abs($inv['balance_kes'] - $amountKes) < 1.0 && self::phoneMatches($inv['phone'], $msisdn);
+            }));
+            if (count($hits) === 1) {
+                return ['invoice_id' => $hits[0]['id'], 'method' => 'phone_amount', 'note' => '', 'suggested' => null];
+            }
+            if (count($hits) > 1) {
+                $none['note'] = trim($none['note'] . ' Payer has ' . count($hits) . ' open invoices for this amount.');
+            }
+        }
+
+        if (($gw['c2bAmountOnlyMatching'] ?? '') === 'on' && (!$billRefUsable || ($gw['transactionType'] ?? '') === 'CustomerBuyGoodsOnline')) {
+            $open = $open ?? self::listOpenInvoicesWithBalance();
+            $candidate = self::pickUniqueAmountMatch($open, $amountKes, $transTime);
+            if ($candidate !== null) {
+                return ['invoice_id' => $candidate, 'method' => 'amount_timestamp', 'note' => '', 'suggested' => null];
+            }
+        }
+
+        return $none;
     }
 
     /**
-     * Look up a single transaction by ANY of: M-Pesa receipt number,
-     * STK checkout request ID, or account reference (e.g. "INV-42").
-     * Used by the dashboard's "Verify Payment" tool to check whether a
-     * payment a customer claims to have made actually exists on file,
-     * before resorting to a live Daraja query.
+     * Exact-amount matching with due-date disambiguation; null when ambiguous.
      *
-     * @param  string $reference
-     * @return object|null
+     * @param array $open  From listOpenInvoicesWithBalance()
      */
-    public static function findTransactionByReference(string $reference): ?object
+    public static function pickUniqueAmountMatch(array $open, float $amountKes, string $transTime): ?int
     {
-        self::ensureTables();
+        $candidates = array_values(array_filter($open, function ($inv) use ($amountKes) {
+            return $inv['balance_kes'] >= 0 && abs($inv['balance_kes'] - $amountKes) < 0.01;
+        }));
 
-        $reference = trim($reference);
-        if ($reference === '') {
+        if (count($candidates) === 1) {
+            return $candidates[0]['id'];
+        }
+        if (count($candidates) === 0 || !preg_match('/^\d{14}$/', $transTime)) {
             return null;
         }
 
-        try {
-            return Capsule::table('flexpay_transactions')
-                ->where('mpesa_receipt', $reference)
-                ->orWhere('checkout_request_id', $reference)
-                ->orWhere('account_reference', $reference)
-                ->orderBy('created_at', 'desc')
-                ->first();
-        } catch (\Exception $e) {
+        $txnDate = \DateTime::createFromFormat('!Ymd', substr($transTime, 0, 8));
+        if (!$txnDate) {
             return null;
         }
+
+        $best = null;
+        $tied = [];
+        foreach ($candidates as $inv) {
+            $due = \DateTime::createFromFormat('!Y-m-d', substr($inv['duedate'], 0, 10));
+            if (!$due) {
+                continue;
+            }
+            $diff = (int) $txnDate->diff($due)->days;
+            if ($best === null || $diff < $best) {
+                $best = $diff;
+                $tied = [$inv['id']];
+            } elseif ($diff === $best) {
+                $tied[] = $inv['id'];
+            }
+        }
+
+        return count($tied) === 1 ? $tied[0] : null;
     }
 
     /**
-     * Apply a transaction that's recorded locally as successful, but was
-     * never linked to a WHMCS invoice, to a specific invoice — exactly
-     * the same WHMCS-native path (checkCbInvoiceID → checkCbTransID →
-     * addInvoicePayment) used by automatic reconciliation, just triggered
-     * manually from the "Verify Payment" tool instead of a callback.
-     *
-     * @param  object $transaction        Row from flexpay_transactions
-     * @param  int    $invoiceId
-     * @param  string $adminUsername
-     * @param  string $gatewayModuleName
-     * @return array  ['success' => bool, 'message' => string]
+     * Open invoices this amount could plausibly be a PARTIAL payment toward.
+     * Informational only — shown to the human reconciling it.
      */
-    public static function applyOrphanedTransaction($transaction, int $invoiceId, string $adminUsername, string $gatewayModuleName): array
+    public static function detectPossiblePartials(float $amountKes, string $msisdn = '', int $max = 5): array
+    {
+        if ($amountKes <= 0) {
+            return [];
+        }
+        $out = [];
+        foreach (self::listOpenInvoicesWithBalance() as $inv) {
+            if ($inv['balance_kes'] > $amountKes) {
+                $inv['phone_match'] = $msisdn !== '' && self::phoneMatches($inv['phone'], $msisdn);
+                $out[] = $inv;
+            }
+        }
+        // Invoices belonging to the payer first.
+        usort($out, function ($a, $b) {
+            return (int) $b['phone_match'] - (int) $a['phone_match'];
+        });
+        return array_slice($out, 0, $max);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Reconciliation / orphan application
+    // ─────────────────────────────────────────────────────────────────────
+
+    /**
+     * Apply a successful-but-unlinked transaction to an invoice (admin
+     * Verify tool, customer self-verify, status-query results).
+     */
+    public static function applyOrphanedTransaction($transaction, int $invoiceId, string $actor): array
     {
         self::ensureTables();
 
         if (empty($transaction->mpesa_receipt)) {
             return ['success' => false, 'message' => 'This transaction has no M-Pesa receipt number recorded — cannot safely apply it to an invoice.'];
         }
-
-        try {
-            $normalizedInvoiceId = checkCbInvoiceID($invoiceId, $gatewayModuleName);
-            checkCbTransID($transaction->mpesa_receipt);
-            addInvoicePayment($normalizedInvoiceId, $transaction->mpesa_receipt, (float) $transaction->amount, 0, $gatewayModuleName);
-
-            $outcome = self::classifyPaymentOutcome($normalizedInvoiceId, (float) $transaction->amount);
-
-            Capsule::table('flexpay_transactions')
-                ->where('id', $transaction->id)
-                ->update([
-                    'invoice_id'      => $normalizedInvoiceId,
-                    'payment_outcome' => $outcome['outcome'],
-                    'updated_at'      => date('Y-m-d H:i:s'),
-                ]);
-
-            return [
-                'success' => true,
-                'message' => $outcome['message'],
-                'outcome' => $outcome,
-            ];
-        } catch (\Throwable $e) {
-            return ['success' => false, 'message' => 'Failed to apply payment: ' . $e->getMessage()];
+        if (!empty($transaction->invoice_id)) {
+            return ['success' => false, 'message' => 'This payment is already applied to Invoice #' . (int) $transaction->invoice_id . '.'];
         }
+        if ($transaction->status !== 'success' || $transaction->direction !== 'in') {
+            return ['success' => false, 'message' => 'Only successful incoming payments can be applied to an invoice.'];
+        }
+
+        // Claim first so two admins (or an admin and a customer) can't both apply it.
+        $claimed = Capsule::table('flexpay_transactions')
+            ->where('id', $transaction->id)
+            ->whereNull('invoice_id')
+            ->update(['invoice_id' => $invoiceId, 'updated_at' => self::now()]);
+        if ($claimed !== 1) {
+            return ['success' => false, 'message' => 'This payment was just applied elsewhere.'];
+        }
+
+        $apply = self::applyPaymentToInvoice($invoiceId, (string) $transaction->mpesa_receipt, (float) $transaction->amount);
+
+        if (!$apply['applied']) {
+            Capsule::table('flexpay_transactions')->where('id', $transaction->id)->update(['invoice_id' => null]);
+            return ['success' => false, 'message' => 'Failed to apply payment: ' . $apply['message']];
+        }
+
+        Capsule::table('flexpay_transactions')->where('id', $transaction->id)->update([
+            'payment_outcome' => $apply['outcome']['outcome'] ?? null,
+            'result_desc'     => substr($apply['message'], 0, 255),
+            'updated_at'      => self::now(),
+        ]);
+        self::markUnmatchedResolved((string) $transaction->mpesa_receipt, $invoiceId, $actor);
+        self::logApiCall('apply_payment', ['receipt' => $transaction->mpesa_receipt, 'invoice_id' => $invoiceId], ['message' => $apply['message']], true, $actor);
+
+        return ['success' => true, 'message' => $apply['message'], 'outcome' => $apply['outcome']];
     }
 
     /**
-     * Invoice-scoped, self-service payment verification — the core logic
-     * shared by BOTH the customer-facing "Verify My Payment" box on the
-     * invoice page and the admin dashboard's "Verify a Payment" tool.
+     * Customer self-service verification for ONE invoice (verify.php).
      *
-     * Unlike the admin tool, this is deliberately invoice-LOCKED: every
-     * lookup and every auto-apply is constrained to the one invoice the
-     * caller already has legitimate access to (proven by the calling
-     * endpoint's own CSRF/HMAC check against that specific invoice — see
-     * verify.php). This method itself never accepts an arbitrary target
-     * invoice number, which is what keeps a public-facing endpoint safe
-     * from being used to nudge a payment onto someone else's invoice or
-     * to probe receipts belonging to other customers:
-     *
-     *   - A receipt/reference belonging to a DIFFERENT invoice is treated
-     *     as "not found for this invoice" — never described, confirmed,
-     *     or have its real owner revealed.
-     *   - If found locally and successful, it is auto-applied to THIS
-     *     invoice only if it isn't already linked elsewhere.
-     *   - If nothing is found locally, a live Daraja Transaction Status
-     *     Query is attempted, but only if a per-invoice rate limit has
-     *     not been exceeded (see checkAndBumpVerifyRateLimit) — this is
-     *     the one part of the flow that costs a real external API call,
-     *     so it's the part that needs throttling against abuse.
-     *
-     * @param  string $reference   Receipt, checkout request ID, or account reference
-     * @param  int    $invoiceId   The invoice this request is scoped to
-     * @param  string $gatewayModuleName
-     * @return array  ['success' => bool, 'message' => string, 'applied' => bool]
+     * Security model:
+     *   - The caller has already proven, with a signed invoice token, that
+     *     WHMCS showed them this invoice.
+     *   - Lookups are by M-Pesa RECEIPT NUMBER ONLY — the one value only the
+     *     payer knows (it's in their confirmation SMS). v3.4 also matched
+     *     account references and checkout IDs, which let anyone who guessed
+     *     a common reference ("RENT", a name) claim someone else's
+     *     unmatched payment onto their own invoice.
+     *   - A receipt that belongs to another invoice is reported as "not
+     *     found" — never confirmed or described.
+     *   - Every attempt is rate-limited per invoice AND per IP; the live
+     *     Daraja query path has a tighter limit.
      */
-    public static function verifyPaymentForInvoice(string $reference, int $invoiceId, string $gatewayModuleName): array
+    public static function verifyPaymentForInvoice(string $reference, int $invoiceId, string $clientIp = ''): array
     {
         self::ensureTables();
 
-        $reference = trim($reference);
-        if ($reference === '' || $invoiceId <= 0) {
-            return ['success' => false, 'applied' => false, 'message' => 'Enter a valid M-Pesa receipt number or reference.'];
+        $notFound = 'We could not find that payment yet. If you just paid, please wait a moment and try again, or contact support with your receipt number.';
+
+        $receipt = FlexPaySecurity::normalizeReceipt($reference);
+        if ($receipt === null || $invoiceId <= 0) {
+            return ['success' => false, 'applied' => false, 'message' => 'Enter the 10-character M-Pesa receipt number from your confirmation SMS (e.g. NLJ7RT61SV).'];
         }
 
-        $local = self::findTransactionByReference($reference);
+        if (!FlexPaySecurity::rateLimit('verify_inv_' . $invoiceId, 10, 600)
+            || ($clientIp !== '' && !FlexPaySecurity::rateLimit('verify_ip_' . $clientIp, 20, 600))) {
+            return ['success' => false, 'applied' => false, 'message' => 'Too many verification attempts. Please wait a few minutes and try again, or contact support.'];
+        }
+
+        $local = self::findTransactionByReceipt($receipt);
 
         if ($local) {
-            // Found, but it belongs to a different invoice entirely — never
-            // confirm, describe, or hint at whose invoice it actually is.
             if ($local->invoice_id && (int) $local->invoice_id !== $invoiceId) {
-                return [
-                    'success' => false, 'applied' => false,
-                    'message' => 'We could not find that reference for this invoice. Double-check the receipt number and try again.',
-                ];
+                return ['success' => false, 'applied' => false, 'message' => 'We could not find that receipt for this invoice. Double-check the receipt number and try again.'];
             }
 
-            if ($local->status === 'success') {
+            if ($local->status === 'success' && $local->direction === 'in') {
                 if ($local->invoice_id) {
-                    return [
-                        'success' => true, 'applied' => false,
-                        'message' => 'This payment has already been applied to this invoice. If the page hasn\'t updated yet, refresh it.',
-                    ];
+                    return ['success' => true, 'applied' => false, 'already' => true, 'message' => 'This payment has already been applied to this invoice. If the page hasn\'t updated yet, refresh it.'];
                 }
 
-                // Successful, not yet linked to ANY invoice — safe to apply
-                // here since the customer is verified to be on THIS invoice
-                // (the calling endpoint already proved that via its own
-                // per-invoice token check before ever calling this method).
-                $result = self::applyOrphanedTransaction($local, $invoiceId, 'customer_self_verify', $gatewayModuleName);
+                $result = self::applyOrphanedTransaction($local, $invoiceId, 'customer_self_verify');
                 return [
                     'success' => $result['success'], 'applied' => $result['success'],
                     'message' => $result['success']
@@ -746,137 +1359,128 @@ class FlexPayStore
             }
 
             if ($local->status === 'pending') {
-                return [
-                    'success' => false, 'applied' => false,
-                    'message' => 'We can see this payment is still being processed. Please wait a few seconds and try again.',
-                ];
+                return ['success' => false, 'applied' => false, 'message' => 'This payment is still being processed. Please wait a few seconds and try again.'];
             }
 
-            // failed / reversed
-            return [
-                'success' => false, 'applied' => false,
-                'message' => 'That payment did not complete successfully (' . ($local->result_desc ?: 'declined or reversed') . '). Please try paying again.',
-            ];
+            return ['success' => false, 'applied' => false, 'message' => 'That payment did not complete successfully. Please try paying again.'];
         }
 
-        // Nothing on file at all for this reference — fall back to a live
-        // Daraja check, but only within the per-invoice rate limit, since
-        // this is the one path that costs a real external API call and is
-        // reachable without a WHMCS login.
-        if (!self::checkAndBumpVerifyRateLimit($invoiceId)) {
-            return [
-                'success' => false, 'applied' => false,
-                'message' => 'Too many verification attempts for this invoice. Please wait a minute and try again, or contact support.',
-            ];
+        // Nothing on file — ask Safaricom (costs an API call, so tighter limit).
+        if (!FlexPaySecurity::rateLimit('verify_live_inv_' . $invoiceId, 3, 600)) {
+            return ['success' => false, 'applied' => false, 'message' => $notFound];
         }
 
-        if (!function_exists('getGatewayVariables')) {
-            self::ensureGatewayFunctionsLoaded();
-        }
-
-        $gw = function_exists('getGatewayVariables') ? getGatewayVariables($gatewayModuleName) : ['type' => ''];
-
-        if (!$gw['type'] || empty($gw['b2cInitiatorName']) || empty($gw['b2cSecurityCredential'])) {
-            return [
-                'success' => false, 'applied' => false,
-                'message' => 'We could not find that payment yet. If you just paid, please wait a moment and try again, or contact support with your receipt number.',
-            ];
+        $gw = self::getFlexPayGatewayParams();
+        $initiator = DarajaClient::initiatorCredentials($gw);
+        if (empty($gw['type']) || $initiator === null) {
+            return ['success' => false, 'applied' => false, 'message' => $notFound];
         }
 
         try {
             $client    = DarajaClient::fromGatewayParams($gw);
-            $systemUrl = rtrim((class_exists('App') ? \App::getSystemURL() : ''), '/');
+            $systemUrl = self::systemUrl($gw);
 
             $response = $client->transactionStatus([
-                'initiatorName'      => $gw['b2cInitiatorName'],
-                'securityCredential' => $gw['b2cSecurityCredential'],
-                'transactionId'      => $reference,
-                'partyA'             => $gw['businessShortcode'],
+                'initiatorName'      => $initiator['name'],
+                'securityCredential' => $initiator['credential'],
+                'transactionId'      => $receipt,
+                'partyA'             => DarajaClient::c2bShortcode($gw),
                 'identifierType'     => '4',
-                'remarks'            => 'Customer self-verification — Invoice #' . $invoiceId,
-                'resultUrl'          => $systemUrl . '/modules/gateways/callback/flexpay.php?route=status_result',
-                'timeoutUrl'         => $systemUrl . '/modules/gateways/callback/flexpay.php?route=status_timeout',
+                'remarks'            => 'Self verify inv ' . $invoiceId,
+                'resultUrl'          => FlexPaySecurity::callbackUrl($systemUrl, 'status_result'),
+                'timeoutUrl'         => FlexPaySecurity::callbackUrl($systemUrl, 'status_timeout'),
             ]);
 
-            $accepted = isset($response['ResponseCode']) && (string) $response['ResponseCode'] === '0';
-            self::logApiCall('customer_verify_status_query', ['reference' => $reference, 'invoice_id' => $invoiceId], $response, $accepted, 'customer_self_verify');
+            $accepted = DarajaClient::isAccepted($response);
+            self::logApiCall('customer_verify_status_query', ['reference' => $receipt, 'invoice_id' => $invoiceId], $response, $accepted, 'customer_self_verify');
+
+            if ($accepted) {
+                self::storeStatusQueryContext($response, [
+                    'purpose' => 'customer_verify', 'invoice_id' => $invoiceId, 'receipt' => $receipt,
+                ]);
+            }
 
             return [
-                'success' => $accepted, 'applied' => false,
+                'success' => $accepted, 'applied' => false, 'pending' => $accepted,
                 'message' => $accepted
-                    ? 'We\'re checking that with Safaricom now — this can take a few seconds. Please refresh shortly, or contact support if it doesn\'t update.'
-                    : 'We could not find that payment yet. If you just paid, please wait a moment and try again, or contact support with your receipt number.',
+                    ? 'We\'re confirming that payment with Safaricom now. This page will update automatically once it\'s confirmed.'
+                    : $notFound,
             ];
         } catch (\Throwable $e) {
-            return [
-                'success' => false, 'applied' => false,
-                'message' => 'We could not find that payment yet. If you just paid, please wait a moment and try again, or contact support with your receipt number.',
-            ];
+            return ['success' => false, 'applied' => false, 'message' => $notFound];
         }
     }
 
-    /**
-     * Lightweight per-invoice rate limiter for the live-Daraja-query path
-     * of customer self-verification, stored in the existing flexpay_settings
-     * key-value table (no new table needed). Allows a small number of
-     * attempts within a rolling window, then forces a cooldown — enough
-     * for a genuine customer to retry a typo, not enough for someone to
-     * use the endpoint to spam Daraja or probe many random receipts.
-     *
-     * @param  int $invoiceId
-     * @param  int $maxAttempts   Allowed attempts per window
-     * @param  int $windowSeconds Window length in seconds
-     * @return bool  true if this attempt is allowed (and has been counted), false if rate-limited
-     */
-    public static function checkAndBumpVerifyRateLimit(int $invoiceId, int $maxAttempts = 5, int $windowSeconds = 60): bool
-    {
-        self::ensureTables();
-
-        $key = 'verify_rl_invoice_' . $invoiceId;
-        $raw = self::getSetting($key);
-        $now = time();
-
-        $state = $raw ? json_decode((string) $raw, true) : null;
-
-        if (!is_array($state) || !isset($state['window_start'], $state['count'])) {
-            $state = ['window_start' => $now, 'count' => 0];
-        }
-
-        if ($now - (int) $state['window_start'] > $windowSeconds) {
-            // Window expired — start a fresh one.
-            $state = ['window_start' => $now, 'count' => 0];
-        }
-
-        if ((int) $state['count'] >= $maxAttempts) {
-            return false;
-        }
-
-        $state['count']++;
-        self::setSetting($key, json_encode($state));
-
-        return true;
-    }
-
-    /**
-     * Clear the self-verify rate limit for one invoice — used by the
-     * admin dashboard when a genuine customer gets blocked after several
-     * legitimate retries and contacts support.
-     *
-     * @param  int $invoiceId
-     * @return void
-     */
+    /** Clear a customer's self-verify rate limits for one invoice (admin tool). */
     public static function clearVerifyRateLimit(int $invoiceId): void
     {
-        self::ensureTables();
+        FlexPaySecurity::clearRateLimit('verify_inv_' . $invoiceId);
+        FlexPaySecurity::clearRateLimit('verify_live_inv_' . $invoiceId);
+        self::deleteSetting('verify_rl_invoice_' . $invoiceId); // pre-3.5 key
+    }
 
-        try {
-            Capsule::table('flexpay_settings')->where('setting_key', 'verify_rl_invoice_' . $invoiceId)->update([
-                'setting_value' => json_encode(['window_start' => time(), 'count' => 0]),
-                'updated_at'    => date('Y-m-d H:i:s'),
-            ]);
-        } catch (\Exception $e) {
-            // Non-fatal — worst case the customer just waits out the window
+    /**
+     * Remember why an async Transaction Status Query was sent, keyed by the
+     * IDs Daraja will echo back in the result callback.
+     */
+    public static function storeStatusQueryContext(array $response, array $context): void
+    {
+        $context['created'] = time();
+        foreach (['ConversationID', 'OriginatorConversationID'] as $k) {
+            if (!empty($response[$k])) {
+                self::setSetting('sq_' . substr(hash('sha256', (string) $response[$k]), 0, 40), json_encode($context));
+            }
         }
+    }
+
+    public static function takeStatusQueryContext(array $result): ?array
+    {
+        foreach (['ConversationID', 'OriginatorConversationID'] as $k) {
+            if (empty($result[$k])) {
+                continue;
+            }
+            $key = 'sq_' . substr(hash('sha256', (string) $result[$k]), 0, 40);
+            $ctx = json_decode((string) self::getSetting($key, ''), true);
+            if (is_array($ctx)) {
+                self::deleteSetting($key);
+                return $ctx;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Username of the logged-in WHMCS admin, for audit trails. WHMCS keeps
+     * only the admin ID in the session, not the username.
+     */
+    public static function currentAdminUsername(string $fallback = 'system'): string
+    {
+        if (!empty($_SESSION['adminusername']) && is_string($_SESSION['adminusername'])) {
+            return $_SESSION['adminusername'];
+        }
+        $adminId = (int) ($_SESSION['adminid'] ?? 0);
+        if ($adminId <= 0) {
+            return $fallback;
+        }
+        try {
+            $name = Capsule::table('tbladmins')->where('id', $adminId)->value('username');
+            return $name ? (string) $name : 'admin#' . $adminId;
+        } catch (\Throwable $e) {
+            return 'admin#' . $adminId;
+        }
+    }
+
+    public static function systemUrl(array $gw = []): string
+    {
+        $url = (string) ($gw['systemurl'] ?? '');
+        if ($url === '' && class_exists('App')) {
+            try {
+                $url = (string) \App::getSystemURL();
+            } catch (\Throwable $e) {
+                $url = '';
+            }
+        }
+        return rtrim($url, '/');
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -886,53 +1490,65 @@ class FlexPayStore
     public static function storeUnmatched(array $data): void
     {
         self::ensureTables();
-        $data['created_at'] = date('Y-m-d H:i:s');
-        $data['matched']    = $data['matched'] ?? 0; // explicit, don't rely on schema default alone
+        $data['created_at'] = self::now();
+        $data['matched']    = $data['matched'] ?? 0;
+        foreach (['notes' => 255, 'bill_ref' => 50, 'customer_name' => 150, 'phone' => 64, 'trans_id' => 30] as $col => $max) {
+            if (isset($data[$col])) {
+                $data[$col] = substr((string) $data[$col], 0, $max);
+            }
+        }
 
         try {
-            // Avoid insertOrIgnore() — only available in newer Laravel/Illuminate
-            // releases, and we can't assume which version ships inside any
-            // given WHMCS install. A plain existence check + insert is
-            // portable across every version WHMCS has bundled.
-            $exists = Capsule::table('flexpay_unmatched_payments')
-                ->where('trans_id', $data['trans_id'])
-                ->exists();
-
-            if (!$exists) {
+            if (!Capsule::table('flexpay_unmatched_payments')->where('trans_id', $data['trans_id'])->exists()) {
                 Capsule::table('flexpay_unmatched_payments')->insert($data);
             }
-        } catch (\Exception $e) {
-            // Non-fatal
+        } catch (\Throwable $e) {
+            self::activity('storeUnmatched failed — ' . $e->getMessage());
         }
     }
 
     public static function listUnmatched(bool $onlyUnmatched = true): array
     {
         self::ensureTables();
-
         try {
             $query = Capsule::table('flexpay_unmatched_payments');
             if ($onlyUnmatched) {
                 $query->where('matched', 0);
             }
-            return $query->orderBy('created_at', 'desc')->get()->toArray();
-        } catch (\Exception $e) {
+            return self::rows($query->orderBy('created_at', 'desc')->get());
+        } catch (\Throwable $e) {
             return [];
         }
     }
 
+    public static function countUnmatched(): int
+    {
+        self::ensureTables();
+        try {
+            return (int) Capsule::table('flexpay_unmatched_payments')->where('matched', 0)->count();
+        } catch (\Throwable $e) {
+            return 0;
+        }
+    }
+
+    private static function markUnmatchedResolved(string $transId, ?int $invoiceId, string $actor): void
+    {
+        try {
+            Capsule::table('flexpay_unmatched_payments')->where('trans_id', $transId)->where('matched', 0)->update([
+                'matched'            => 1,
+                'matched_invoice_id' => $invoiceId,
+                'matched_by'         => substr($actor, 0, 100),
+                'matched_at'         => self::now(),
+            ]);
+        } catch (\Throwable $e) {
+            // non-fatal
+        }
+    }
+
     /**
-     * Reconcile an unmatched C2B payment to a specific invoice. Applies
-     * the payment via WHMCS's native addInvoicePayment() and marks the
-     * unmatched record resolved.
-     *
-     * @param  int    $unmatchedId
-     * @param  int    $invoiceId
-     * @param  string $adminUsername
-     * @param  string $gatewayModuleName
-     * @return array  ['success' => bool, 'message' => string]
+     * Admin: apply an unmatched payment to a chosen invoice.
      */
-    public static function reconcileUnmatched(int $unmatchedId, int $invoiceId, string $adminUsername, string $gatewayModuleName): array
+    public static function reconcileUnmatched(int $unmatchedId, int $invoiceId, string $adminUsername): array
     {
         self::ensureTables();
 
@@ -945,24 +1561,148 @@ class FlexPayStore
                 return ['success' => false, 'message' => 'This payment has already been reconciled.'];
             }
 
-            // Use WHMCS's own helpers so the invoice updates exactly as if
-            // the callback had matched it automatically.
-            $normalizedInvoiceId = checkCbInvoiceID($invoiceId, $gatewayModuleName);
-            checkCbTransID($row->trans_id);
-            addInvoicePayment($normalizedInvoiceId, $row->trans_id, $row->amount, 0, $gatewayModuleName);
+            // Claim the row before touching money so a double-submit can't
+            // apply it twice.
+            $claimed = Capsule::table('flexpay_unmatched_payments')->where('id', $unmatchedId)->where('matched', 0)
+                ->update(['matched' => 1, 'matched_by' => substr($adminUsername, 0, 100), 'matched_at' => self::now()]);
+            if ($claimed !== 1) {
+                return ['success' => false, 'message' => 'This payment has already been reconciled.'];
+            }
 
-            $outcome = self::classifyPaymentOutcome($normalizedInvoiceId, (float) $row->amount);
+            $apply = self::applyPaymentToInvoice($invoiceId, (string) $row->trans_id, (float) $row->amount);
 
-            Capsule::table('flexpay_unmatched_payments')->where('id', $unmatchedId)->update([
-                'matched'            => 1,
-                'matched_invoice_id' => $normalizedInvoiceId,
-                'matched_by'         => $adminUsername,
-                'matched_at'         => date('Y-m-d H:i:s'),
-            ]);
+            if (!$apply['applied']) {
+                Capsule::table('flexpay_unmatched_payments')->where('id', $unmatchedId)
+                    ->update(['matched' => 0, 'matched_by' => '', 'matched_at' => null]);
+                return ['success' => false, 'message' => $apply['message']];
+            }
 
-            return ['success' => true, 'message' => $outcome['message'], 'outcome' => $outcome];
+            Capsule::table('flexpay_unmatched_payments')->where('id', $unmatchedId)->update(['matched_invoice_id' => $invoiceId]);
+
+            // Link the ledger row too, so the Transactions tab shows the invoice.
+            $client = self::getInvoice($invoiceId);
+            Capsule::table('flexpay_transactions')
+                ->where(function ($q) use ($row) {
+                    $q->where('mpesa_receipt', $row->trans_id)->orWhere('checkout_request_id', $row->trans_id);
+                })
+                ->update([
+                    'invoice_id'      => $invoiceId,
+                    'client_id'       => $client ? (int) $client->userid : null,
+                    'payment_outcome' => $apply['outcome']['outcome'] ?? null,
+                    'result_desc'     => substr('Reconciled by ' . $adminUsername . ': ' . $apply['message'], 0, 255),
+                    'updated_at'      => self::now(),
+                ]);
+
+            self::logApiCall('reconcile', ['trans_id' => $row->trans_id, 'invoice_id' => $invoiceId], ['message' => $apply['message']], true, $adminUsername);
+
+            return ['success' => true, 'message' => $apply['message'], 'outcome' => $apply['outcome']];
         } catch (\Throwable $e) {
-            return ['success' => false, 'message' => $e->getMessage()];
+            return ['success' => false, 'message' => 'Reconciliation failed: ' . $e->getMessage()];
+        }
+    }
+
+    /** Admin: mark an unmatched payment as not belonging to any invoice. */
+    public static function dismissUnmatched(int $unmatchedId, string $adminUsername, string $reason): array
+    {
+        self::ensureTables();
+        try {
+            $updated = Capsule::table('flexpay_unmatched_payments')->where('id', $unmatchedId)->where('matched', 0)->update([
+                'matched'    => 1,
+                'matched_by' => substr($adminUsername . ' (dismissed)', 0, 100),
+                'notes'      => substr('Dismissed: ' . ($reason !== '' ? $reason : 'no reason given'), 0, 255),
+                'matched_at' => self::now(),
+            ]);
+            if ($updated !== 1) {
+                return ['success' => false, 'message' => 'Payment not found or already resolved.'];
+            }
+            self::logApiCall('dismiss_unmatched', ['id' => $unmatchedId, 'reason' => $reason], ['dismissed' => true], true, $adminUsername);
+            return ['success' => true, 'message' => 'Payment dismissed from the reconciliation queue.'];
+        } catch (\Throwable $e) {
+            return ['success' => false, 'message' => 'Could not dismiss payment: ' . $e->getMessage()];
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Listing / stats
+    // ─────────────────────────────────────────────────────────────────────
+
+    public static function transactionQuery(array $filters = [])
+    {
+        $query = Capsule::table('flexpay_transactions');
+
+        if (!empty($filters['channel']) && in_array($filters['channel'], ['stk', 'c2b', 'b2c', 'reversal'], true)) {
+            $query->where('channel', $filters['channel']);
+        }
+        if (!empty($filters['status']) && in_array($filters['status'], ['pending', 'success', 'failed', 'reversed'], true)) {
+            $query->where('status', $filters['status']);
+        }
+        if (!empty($filters['invoice_id'])) {
+            $query->where('invoice_id', (int) $filters['invoice_id']);
+        }
+        if (!empty($filters['search'])) {
+            $term = str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], substr((string) $filters['search'], 0, 60));
+            $query->where(function ($q) use ($term) {
+                $q->where('mpesa_receipt', 'like', "%{$term}%")
+                  ->orWhere('phone', 'like', "%{$term}%")
+                  ->orWhere('account_reference', 'like', "%{$term}%")
+                  ->orWhere('checkout_request_id', 'like', "%{$term}%");
+            });
+        }
+        if (!empty($filters['date_from']) && preg_match('/^\d{4}-\d{2}-\d{2}$/', $filters['date_from'])) {
+            $query->where('created_at', '>=', $filters['date_from'] . ' 00:00:00');
+        }
+        if (!empty($filters['date_to']) && preg_match('/^\d{4}-\d{2}-\d{2}$/', $filters['date_to'])) {
+            $query->where('created_at', '<=', $filters['date_to'] . ' 23:59:59');
+        }
+
+        return $query;
+    }
+
+    public static function listTransactions(array $filters = [], int $page = 1, int $perPage = 25): array
+    {
+        self::ensureTables();
+
+        try {
+            $query = self::transactionQuery($filters);
+            $total = (clone $query)->count();
+            $data  = self::rows($query->orderBy('created_at', 'desc')->orderBy('id', 'desc')
+                ->skip((max(1, $page) - 1) * $perPage)
+                ->take($perPage)
+                ->get());
+
+            return ['data' => $data, 'total' => $total];
+        } catch (\Throwable $e) {
+            return ['data' => [], 'total' => 0];
+        }
+    }
+
+    public static function getStats(int $days = 30): array
+    {
+        self::ensureTables();
+
+        $days  = max(1, min(3650, $days));
+        $since = date('Y-m-d H:i:s', strtotime("-{$days} days"));
+
+        try {
+            $base = Capsule::table('flexpay_transactions')->where('created_at', '>=', $since);
+
+            return [
+                'total_in'        => (float) (clone $base)->where('direction', 'in')->where('status', 'success')->sum('amount'),
+                'total_out'       => (float) (clone $base)->where('direction', 'out')->where('status', 'success')->sum('amount'),
+                'success_count'   => (int) (clone $base)->where('status', 'success')->count(),
+                'failed_count'    => (int) (clone $base)->where('status', 'failed')->count(),
+                'pending_count'   => (int) (clone $base)->where('status', 'pending')->count(),
+                'stk_count'       => (int) (clone $base)->where('channel', 'stk')->where('status', 'success')->count(),
+                'c2b_count'       => (int) (clone $base)->where('channel', 'c2b')->where('status', 'success')->count(),
+                'unmatched_count' => self::countUnmatched(),
+                'period_days'     => $days,
+            ];
+        } catch (\Throwable $e) {
+            return [
+                'total_in' => 0, 'total_out' => 0, 'success_count' => 0,
+                'failed_count' => 0, 'pending_count' => 0, 'stk_count' => 0,
+                'c2b_count' => 0, 'unmatched_count' => 0, 'period_days' => $days,
+            ];
         }
     }
 
@@ -973,38 +1713,69 @@ class FlexPayStore
     public static function recordRefund(array $data): int
     {
         self::ensureTables();
-        $data['created_at'] = date('Y-m-d H:i:s');
+        $data['created_at'] = self::now();
 
         try {
             return (int) Capsule::table('flexpay_refunds')->insertGetId($data);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
+            self::activity('recordRefund failed — ' . $e->getMessage());
             return 0;
         }
     }
 
-    public static function updateRefundByConversationId(string $conversationId, array $data): void
+    /** Find a refund by the IDs Daraja echoes back in a B2C result. */
+    public static function findRefundByIds(string $conversationId, string $originatorId): ?object
     {
         self::ensureTables();
-        $data['updated_at'] = date('Y-m-d H:i:s');
-
         try {
-            Capsule::table('flexpay_refunds')->where('conversation_id', $conversationId)->update($data);
-        } catch (\Exception $e) {
-            // Non-fatal
+            $q = Capsule::table('flexpay_refunds');
+            if ($conversationId !== '' && $originatorId !== '') {
+                $q->where(function ($w) use ($conversationId, $originatorId) {
+                    $w->where('conversation_id', $conversationId)->orWhere('originator_conversation_id', $originatorId);
+                });
+            } elseif ($conversationId !== '') {
+                $q->where('conversation_id', $conversationId);
+            } elseif ($originatorId !== '') {
+                $q->where('originator_conversation_id', $originatorId);
+            } else {
+                return null;
+            }
+            return $q->orderBy('id', 'desc')->first() ?: null;
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    public static function getRefund(int $id): ?object
+    {
+        self::ensureTables();
+        try {
+            return Capsule::table('flexpay_refunds')->where('id', $id)->first() ?: null;
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    public static function updateRefund(int $id, array $data): void
+    {
+        self::ensureTables();
+        $data['updated_at'] = self::now();
+        if (isset($data['result_desc'])) {
+            $data['result_desc'] = substr((string) $data['result_desc'], 0, 255);
+        }
+        try {
+            Capsule::table('flexpay_refunds')->where('id', $id)->update($data);
+        } catch (\Throwable $e) {
+            // non-fatal
         }
     }
 
     public static function listRefunds(int $limit = 50): array
     {
         self::ensureTables();
-
         try {
-            return Capsule::table('flexpay_refunds')
-                ->orderBy('created_at', 'desc')
-                ->take($limit)
-                ->get()
-                ->toArray();
-        } catch (\Exception $e) {
+            return self::rows(Capsule::table('flexpay_refunds')->orderBy('created_at', 'desc')->orderBy('id', 'desc')->take($limit)->get());
+        } catch (\Throwable $e) {
             return [];
         }
     }
@@ -1016,25 +1787,21 @@ class FlexPayStore
     public static function recordBalanceSnapshot(array $data): void
     {
         self::ensureTables();
-        $data['created_at'] = date('Y-m-d H:i:s');
-
+        $data['created_at'] = self::now();
         try {
             Capsule::table('flexpay_balance_snapshots')->insert($data);
-        } catch (\Exception $e) {
-            // Non-fatal
+        } catch (\Throwable $e) {
+            // non-fatal
         }
     }
 
     public static function getLatestBalance(string $shortcode): ?object
     {
         self::ensureTables();
-
         try {
-            return Capsule::table('flexpay_balance_snapshots')
-                ->where('shortcode', $shortcode)
-                ->orderBy('created_at', 'desc')
-                ->first();
-        } catch (\Exception $e) {
+            return Capsule::table('flexpay_balance_snapshots')->where('shortcode', $shortcode)
+                ->orderBy('created_at', 'desc')->orderBy('id', 'desc')->first() ?: null;
+        } catch (\Throwable $e) {
             return null;
         }
     }
@@ -1042,17 +1809,10 @@ class FlexPayStore
     public static function getBalanceHistory(string $shortcode, int $limit = 30): array
     {
         self::ensureTables();
-
         try {
-            return Capsule::table('flexpay_balance_snapshots')
-                ->where('shortcode', $shortcode)
-                ->orderBy('created_at', 'desc')
-                ->take($limit)
-                ->get()
-                ->reverse()
-                ->values()
-                ->toArray();
-        } catch (\Exception $e) {
+            return self::rows(Capsule::table('flexpay_balance_snapshots')->where('shortcode', $shortcode)
+                ->orderBy('created_at', 'desc')->orderBy('id', 'desc')->take($limit)->get());
+        } catch (\Throwable $e) {
             return [];
         }
     }
@@ -1061,37 +1821,111 @@ class FlexPayStore
     // flexpay_api_log
     // ─────────────────────────────────────────────────────────────────────
 
+    /** Keys whose values must never be written to the API log. */
+    private const REDACT_KEYS = [
+        'password', 'passkey', 'securitycredential', 'consumersecret', 'consumerkey',
+        'access_token', 'authorization', 'licensingsecret', 'initiatorpassword', 'localkey', 'secret',
+    ];
+
+    public static function redact($data)
+    {
+        if (!is_array($data)) {
+            return $data;
+        }
+        foreach ($data as $k => $v) {
+            if (is_string($k) && in_array(strtolower($k), self::REDACT_KEYS, true)) {
+                $data[$k] = '[redacted]';
+            } elseif (is_array($v)) {
+                $data[$k] = self::redact($v);
+            }
+        }
+        return $data;
+    }
+
     public static function logApiCall(string $operation, $request, $response, bool $success, string $triggeredBy = 'system'): void
     {
         self::ensureTables();
 
+        $encode = function ($v) {
+            $s = is_string($v) ? $v : json_encode(self::redact($v), JSON_UNESCAPED_SLASHES | JSON_PARTIAL_OUTPUT_ON_ERROR);
+            return substr((string) $s, 0, 60000);
+        };
+
         try {
             Capsule::table('flexpay_api_log')->insert([
-                'operation'     => $operation,
-                'request_data'  => is_string($request) ? $request : json_encode($request),
-                'response_data' => is_string($response) ? $response : json_encode($response),
+                'operation'     => substr($operation, 0, 40),
+                'request_data'  => $encode($request),
+                'response_data' => $encode($response),
                 'success'       => $success ? 1 : 0,
-                'triggered_by'  => $triggeredBy,
-                'created_at'    => date('Y-m-d H:i:s'),
+                'triggered_by'  => substr($triggeredBy, 0, 100),
+                'created_at'    => self::now(),
             ]);
-        } catch (\Exception $e) {
-            // Non-fatal — never let logging break the main flow
+        } catch (\Throwable $e) {
+            // Never let logging break the main flow
         }
     }
 
-    public static function listApiLog(int $limit = 100, ?string $operation = null): array
+    public static function listApiLog(int $limit = 100, ?string $operation = null, ?bool $success = null): array
     {
         self::ensureTables();
-
         try {
             $query = Capsule::table('flexpay_api_log');
             if ($operation) {
                 $query->where('operation', $operation);
             }
-            return $query->orderBy('created_at', 'desc')->take($limit)->get()->toArray();
-        } catch (\Exception $e) {
+            if ($success !== null) {
+                $query->where('success', $success ? 1 : 0);
+            }
+            return self::rows($query->orderBy('created_at', 'desc')->orderBy('id', 'desc')->take($limit)->get());
+        } catch (\Throwable $e) {
             return [];
         }
+    }
+
+    public static function listApiLogOperations(): array
+    {
+        self::ensureTables();
+        try {
+            return self::rows(Capsule::table('flexpay_api_log')->distinct()->orderBy('operation')->pluck('operation'));
+        } catch (\Throwable $e) {
+            return [];
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Housekeeping (cron)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /** @return array counts of rows removed */
+    public static function prune(int $logRetentionDays): array
+    {
+        self::ensureTables();
+        $out = ['rate_limits' => 0, 'status_contexts' => 0, 'api_log' => 0, 'qr_cache' => 0];
+        // Prefix match via SUBSTR, not LIKE 'rl\\_%': backslash escaping in
+        // LIKE is MySQL-specific, and an unescaped "_" is a wildcard.
+        $olderThan = function (array $prefixes, int $seconds) {
+            return Capsule::table('flexpay_settings')
+                ->where(function ($q) use ($prefixes) {
+                    foreach ($prefixes as $p) {
+                        $q->orWhereRaw('SUBSTR(setting_key, 1, ' . strlen($p) . ') = ?', [$p]);
+                    }
+                })
+                ->where('updated_at', '<', date('Y-m-d H:i:s', time() - $seconds))
+                ->delete();
+        };
+        try {
+            $out['rate_limits']     = $olderThan(['rl_', 'verify_rl_'], 86400);
+            $out['status_contexts'] = $olderThan(['sq_'], 7 * 86400);
+            $out['qr_cache']        = $olderThan(['qr_'], 86400);
+            if ($logRetentionDays > 0) {
+                $out['api_log'] = Capsule::table('flexpay_api_log')
+                    ->where('created_at', '<', date('Y-m-d H:i:s', time() - $logRetentionDays * 86400))
+                    ->delete();
+            }
+        } catch (\Throwable $e) {
+            self::activity('prune failed — ' . $e->getMessage());
+        }
+        return $out;
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -1101,11 +1935,10 @@ class FlexPayStore
     public static function getSetting(string $key, $default = null)
     {
         self::ensureTables();
-
         try {
             $row = Capsule::table('flexpay_settings')->where('setting_key', $key)->first();
             return $row ? $row->setting_value : $default;
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return $default;
         }
     }
@@ -1113,23 +1946,60 @@ class FlexPayStore
     public static function setSetting(string $key, $value): void
     {
         self::ensureTables();
-
         try {
-            $exists = Capsule::table('flexpay_settings')->where('setting_key', $key)->exists();
-            if ($exists) {
-                Capsule::table('flexpay_settings')->where('setting_key', $key)->update([
-                    'setting_value' => $value,
-                    'updated_at'    => date('Y-m-d H:i:s'),
-                ]);
-            } else {
-                Capsule::table('flexpay_settings')->insert([
-                    'setting_key'   => $key,
-                    'setting_value' => $value,
-                    'updated_at'    => date('Y-m-d H:i:s'),
-                ]);
+            $updated = Capsule::table('flexpay_settings')->where('setting_key', $key)->update([
+                'setting_value' => $value,
+                'updated_at'    => self::now(),
+            ]);
+            if ($updated === 0 && !Capsule::table('flexpay_settings')->where('setting_key', $key)->exists()) {
+                self::addSettingIfAbsent($key, $value);
             }
-        } catch (\Exception $e) {
-            // Non-fatal
+        } catch (\Throwable $e) {
+            // non-fatal
+        }
+    }
+
+    /** Insert only if the key doesn't exist yet (primary key makes this atomic). */
+    public static function addSettingIfAbsent(string $key, $value): void
+    {
+        self::ensureTables();
+        try {
+            Capsule::table('flexpay_settings')->insert([
+                'setting_key'   => $key,
+                'setting_value' => $value,
+                'updated_at'    => self::now(),
+            ]);
+        } catch (\Throwable $e) {
+            // already present — that's the point
+        }
+    }
+
+    public static function deleteSetting(string $key): void
+    {
+        self::ensureTables();
+        try {
+            Capsule::table('flexpay_settings')->where('setting_key', $key)->delete();
+        } catch (\Throwable $e) {
+            // non-fatal
+        }
+    }
+
+    /**
+     * Normalise a query result to a plain array. Older Illuminate versions
+     * bundled with some WHMCS releases return arrays; newer ones Collections.
+     */
+    public static function rows($result): array
+    {
+        if (is_array($result)) {
+            return $result;
+        }
+        return (is_object($result) && method_exists($result, 'all')) ? $result->all() : (array) $result;
+    }
+
+    private static function activity(string $message): void
+    {
+        if (function_exists('logActivity')) {
+            logActivity('FlexPay: ' . $message);
         }
     }
 }

@@ -4,25 +4,28 @@
  *
  * A complete Safaricom Daraja integration: STK Push checkout, fully
  * automated C2B (paybill/till) reconciliation, B2C refunds, transaction
- * reversal, transaction status queries, and account balance checks.
+ * reversal, transaction status queries, account balance checks and
+ * Dynamic QR codes.
  *
  * Callback URLs intentionally avoid the word "mpesa" anywhere in the path
- * or query string — see modules/gateways/callback/flexpay.php and the
- * ?route= parameter values used throughout.
+ * or query string (Daraja rejects such C2B URLs) — see
+ * modules/gateways/callback/flexpay.php and the ?route= values.
  *
  * File layout (relative to WHMCS root):
  *   modules/gateways/flexpay.php                    ← this file
  *   modules/gateways/callback/flexpay.php            ← Daraja async callbacks
  *   modules/gateways/flexpay/DarajaClient.php        ← shared Daraja API client
  *   modules/gateways/flexpay/FlexPayStore.php        ← shared DB access layer
+ *   modules/gateways/flexpay/FlexPaySecurity.php     ← tokens, callback auth, rate limits
  *   modules/gateways/flexpay/FlexPayLicense.php      ← commercial license enforcement
+ *   modules/gateways/flexpay/FlexPayService.php      ← shared payment workflows
  *   modules/gateways/flexpay/checkout.php            ← AJAX STK Push initiator
  *   modules/gateways/flexpay/poll.php                ← AJAX status poller
  *   modules/gateways/flexpay/verify.php              ← customer self-verify endpoint
  *
  * @package   FlexPay\Gateway
  * @author    Editoria Cloud Systems <https://www.editoriaweb.co.ke>
- * @version   3.4.0
+ * @version   3.5.0
  * @link      https://developers.whmcs.com/payment-gateways/
  * @link      https://developer.safaricom.co.ke/
  */
@@ -31,22 +34,13 @@ if (!defined('WHMCS')) {
     die('This file cannot be accessed directly');
 }
 
+require_once __DIR__ . '/flexpay/FlexPaySecurity.php';
 require_once __DIR__ . '/flexpay/DarajaClient.php';
 require_once __DIR__ . '/flexpay/FlexPayStore.php';
 require_once __DIR__ . '/flexpay/FlexPayLicense.php';
+require_once __DIR__ . '/flexpay/FlexPayService.php';
 
 // ─── MetaData ─────────────────────────────────────────────────────────────────
-/**
- * Module metadata. Also the entry point for two pieces of automatic,
- * intelligent setup that require zero manual admin action:
- *
- *   1. Database table creation (FlexPayStore::ensureTables)
- *   2. C2B URL auto-(re)registration whenever the configured shortcode or
- *      system URL changes (flexpay_autoRegisterC2B) — see that function's
- *      docblock for how change detection avoids spamming Safaricom.
- *
- * @return array
- */
 function flexpay_MetaData()
 {
     FlexPayStore::ensureTables();
@@ -67,6 +61,8 @@ function flexpay_config()
             'Type'  => 'System',
             'Value' => 'M-Pesa via FlexPay (Daraja)',
         ],
+
+        // ── Daraja app ────────────────────────────────────────────────
         'testMode' => [
             'FriendlyName' => 'Sandbox / Test Mode',
             'Type'         => 'yesno',
@@ -74,7 +70,7 @@ function flexpay_config()
         ],
         'consumerKey' => [
             'FriendlyName' => 'Consumer Key',
-            'Type'         => 'text',
+            'Type'         => 'password',
             'Size'         => '64',
             'Description'  => 'Daraja App Consumer Key',
         ],
@@ -84,17 +80,19 @@ function flexpay_config()
             'Size'         => '64',
             'Description'  => 'Daraja App Consumer Secret',
         ],
+
+        // ── STK Push ──────────────────────────────────────────────────
         'businessShortcode' => [
             'FriendlyName' => 'Business Shortcode',
             'Type'         => 'text',
             'Size'         => '20',
-            'Description'  => 'Your Paybill or Till number (e.g. 174379)',
+            'Description'  => 'Your Paybill number, or for Buy Goods the Store / Head Office number (e.g. 174379)',
         ],
         'passkey' => [
             'FriendlyName' => 'Lipa Na M-Pesa Passkey',
             'Type'         => 'password',
             'Size'         => '100',
-            'Description'  => 'STK Push Passkey from the Daraja portal LNM credentials tab',
+            'Description'  => 'STK Push Passkey from the Daraja portal. Never sent to the browser.',
         ],
         'transactionType' => [
             'FriendlyName' => 'STK Transaction Type',
@@ -103,13 +101,32 @@ function flexpay_config()
             'Default'      => 'CustomerPayBillOnline',
             'Description'  => 'PayBillOnline for paybill numbers, BuyGoodsOnline for till numbers',
         ],
+        'stkPartyB' => [
+            'FriendlyName' => 'Till Number (Buy Goods only)',
+            'Type'         => 'text',
+            'Size'         => '20',
+            'Description'  => 'For Buy Goods: the till number customers pay (PartyB) when it differs from the Store number above. Leave blank for Paybill.',
+        ],
         'accountRefPrefix' => [
             'FriendlyName' => 'Account Reference Prefix',
             'Type'         => 'text',
             'Size'         => '10',
             'Default'      => 'INV',
-            'Description'  => 'Prefix used in STK Push account references (e.g. INV → INV-42)',
+            'Description'  => 'Prefix used in account references (e.g. INV → INV-42). Letters/digits only.',
         ],
+        'showQrCode' => [
+            'FriendlyName' => 'Show M-Pesa QR Code',
+            'Type'         => 'yesno',
+            'Description'  => 'Show a Daraja Dynamic QR code on the invoice that customers can scan in the M-Pesa app.',
+        ],
+        'qrMerchantName' => [
+            'FriendlyName' => 'QR Merchant Name',
+            'Type'         => 'text',
+            'Size'         => '40',
+            'Description'  => 'Business name shown in the M-Pesa app when the QR code is scanned (defaults to your WHMCS company name).',
+        ],
+
+        // ── C2B ───────────────────────────────────────────────────────
         'autoRegisterC2B' => [
             'FriendlyName' => 'Auto-Register C2B URLs',
             'Type'         => 'yesno',
@@ -127,26 +144,93 @@ function flexpay_config()
             'Type'         => 'dropdown',
             'Options'      => 'strict,lenient',
             'Default'      => 'lenient',
-            'Description'  => 'strict = reject payments whose account reference does not match an open invoice. lenient = accept all, reconcile later in the dashboard.',
+            'Description'  => 'strict = reject paybill payments whose account number does not match an open invoice. lenient = accept all, reconcile later in the dashboard. (External validation must be enabled on your shortcode by Safaricom.)',
         ],
+        'c2bPhoneMatching' => [
+            'FriendlyName' => 'Match C2B by Payer Phone',
+            'Type'         => 'yesno',
+            'Default'      => 'on',
+            'Description'  => 'Apply a payment with no usable reference when the payer\'s phone matches exactly one client with an open invoice for that amount (ideal for Till payments).',
+        ],
+        'c2bAmountOnlyMatching' => [
+            'FriendlyName' => 'Match C2B by Amount Only',
+            'Type'         => 'yesno',
+            'Description'  => 'Also apply reference-less payments when the amount matches exactly one open invoice. Riskier — can credit the wrong customer if an unrelated payment shares the amount. Off by default.',
+        ],
+
+        // ── B2C / initiator ───────────────────────────────────────────
         'b2cShortcode' => [
             'FriendlyName' => 'B2C Shortcode',
             'Type'         => 'text',
             'Size'         => '20',
-            'Description'  => 'Shortcode used for Business-to-Customer refund disbursements',
+            'Description'  => 'Shortcode used for Business-to-Customer refund disbursements (defaults to Business Shortcode)',
+        ],
+        'b2cCommandId' => [
+            'FriendlyName' => 'B2C Command',
+            'Type'         => 'dropdown',
+            'Options'      => 'BusinessPayment,SalaryPayment,PromotionPayment',
+            'Default'      => 'BusinessPayment',
+            'Description'  => 'B2C CommandID used for refunds. BusinessPayment is correct for most accounts.',
         ],
         'b2cInitiatorName' => [
-            'FriendlyName' => 'B2C Initiator Name',
+            'FriendlyName' => 'Initiator Name',
             'Type'         => 'text',
             'Size'         => '40',
-            'Description'  => 'API operator username configured in the Daraja portal',
+            'Description'  => 'API operator username from the M-Pesa org portal. Needed for refunds, reversals, balance and status queries.',
         ],
         'b2cSecurityCredential' => [
-            'FriendlyName' => 'B2C Security Credential',
+            'FriendlyName' => 'Security Credential',
             'Type'         => 'password',
             'Size'         => '255',
-            'Description'  => 'RSA-encrypted + base64-encoded initiator password (generated on Daraja portal)',
+            'Description'  => 'Encrypted initiator password from the Daraja portal. Leave blank to have FlexPay generate it from the two fields below.',
         ],
+        'initiatorPassword' => [
+            'FriendlyName' => 'Initiator Password (optional)',
+            'Type'         => 'password',
+            'Size'         => '64',
+            'Description'  => 'Only needed if Security Credential is blank.',
+        ],
+        'initiatorCertificate' => [
+            'FriendlyName' => 'Safaricom Certificate (optional)',
+            'Type'         => 'textarea',
+            'Rows'         => '4',
+            'Cols'         => '60',
+            'Description'  => 'Paste Safaricom\'s sandbox or production public certificate (PEM) to auto-generate the Security Credential from the Initiator Password.',
+        ],
+
+        // ── Security ──────────────────────────────────────────────────
+        'callbackSecurity' => [
+            'FriendlyName' => 'Callback Security',
+            'Type'         => 'dropdown',
+            'Options'      => [
+                'token_or_ip' => 'Secret URL key OR Safaricom IP (recommended)',
+                'token_only'  => 'Secret URL key only (strictest)',
+                'ip_only'     => 'Safaricom IP only',
+                'off'         => 'Off — accept any caller (NOT recommended)',
+            ],
+            'Default'      => 'token_or_ip',
+            'Description'  => 'How FlexPay authenticates Daraja callbacks. Forged callbacks could otherwise mark invoices paid.',
+        ],
+        'verifyStkCallbacks' => [
+            'FriendlyName' => 'Double-check STK Results',
+            'Type'         => 'yesno',
+            'Default'      => 'on',
+            'Description'  => 'Confirm every successful STK callback with Daraja\'s STK Query API before crediting the invoice. Recommended: leave ON.',
+        ],
+        'trustedProxies' => [
+            'FriendlyName' => 'Trusted Proxies',
+            'Type'         => 'text',
+            'Size'         => '60',
+            'Description'  => 'Comma-separated IPs/CIDRs of your own reverse proxy or CDN (e.g. Cloudflare). Only these may set X-Forwarded-For. Leave blank if WHMCS is not behind a proxy.',
+        ],
+        'extraCallbackIps' => [
+            'FriendlyName' => 'Extra Callback IPs',
+            'Type'         => 'text',
+            'Size'         => '60',
+            'Description'  => 'Additional Safaricom callback IPs/CIDRs, if Safaricom publishes new ones.',
+        ],
+
+        // ── Licensing ─────────────────────────────────────────────────
         'licenseKey' => [
             'FriendlyName' => 'FlexPay License Key',
             'Type'         => 'text',
@@ -162,46 +246,68 @@ function flexpay_config()
     ];
 }
 
+/** Account reference for an invoice ("INV-42"). */
+function flexpay_account_reference(array $params, int $invoiceId): string
+{
+    return FlexPayService::accountReference($params, $invoiceId);
+}
+
 // ─── Payment link (STK Push UI) ───────────────────────────────────────────────
 function flexpay_link($params)
 {
     $license = FlexPayLicense::check($params);
-
     if (!$license['valid']) {
         return flexpay_render_license_block($license, $params);
     }
 
     flexpay_autoRegisterC2B($params);
 
-    $invoiceId  = (int) $params['invoiceid'];
-    $amount     = (int) ceil((float) $params['amount']);
-    $systemUrl  = rtrim($params['systemurl'], '/');
-    $returnUrl  = $params['returnurl'];
+    $invoiceId = (int) $params['invoiceid'];
+    $amount    = FlexPayStore::invoiceBalanceInKes($invoiceId);
 
-    $rawPhone     = $params['clientdetails']['phonenumber'] ?? '';
-    $cleanPhone   = DarajaClient::formatPhone($rawPhone);
+    if ($amount === null) {
+        // Invoice in a non-KES currency and no KES currency configured.
+        FlexPayStore::logApiCall('currency_unsupported', ['invoice_id' => $invoiceId, 'currency' => $params['currency'] ?? ''], [], false, 'system');
+        return flexpay_render_notice('M-Pesa payments are processed in Kenyan Shillings. Please choose another payment method or contact us.');
+    }
+    if ($amount < 1) {
+        return '';
+    }
+
+    $systemUrl = rtrim((string) $params['systemurl'], '/');
+    $returnUrl = (string) $params['returnurl'];
+
+    $cleanPhone   = DarajaClient::formatPhone((string) ($params['clientdetails']['phonenumber'] ?? ''));
     $displayPhone = DarajaClient::toDisplayPhone($cleanPhone);
 
-    $shortcode  = $params['businessShortcode'];
-    $passkey    = $params['passkey'];
-    $txnType    = $params['transactionType'] ?: 'CustomerPayBillOnline';
-    $isTill     = ($txnType === 'CustomerBuyGoodsOnline');
-    $accPrefix  = $params['accountRefPrefix'] ?: 'INV';
-    $accRef     = $accPrefix . '-' . $invoiceId;
+    $isTill    = (($params['transactionType'] ?? '') === 'CustomerBuyGoodsOnline');
+    $payNumber = $isTill ? DarajaClient::stkPartyB($params) : DarajaClient::c2bShortcode($params);
+    $accRef    = flexpay_account_reference($params, $invoiceId);
 
-    $checkoutUrl = $systemUrl . '/modules/gateways/flexpay/checkout.php';
-    $pollUrl     = $systemUrl . '/modules/gateways/flexpay/poll.php';
-    $verifyUrl   = $systemUrl . '/modules/gateways/flexpay/verify.php';
-    $callbackUrl = $systemUrl . '/modules/gateways/callback/flexpay.php?route=stk_result';
+    $config = [
+        'checkoutUrl' => $systemUrl . '/modules/gateways/flexpay/checkout.php',
+        'pollUrl'     => $systemUrl . '/modules/gateways/flexpay/poll.php',
+        'verifyUrl'   => $systemUrl . '/modules/gateways/flexpay/verify.php',
+        'returnUrl'   => $returnUrl,
+        'invoiceId'   => (string) $invoiceId,
+        // Signed, expiring proof that WHMCS showed this visitor this invoice.
+        // Contains no Daraja credentials.
+        'token'       => FlexPaySecurity::invoiceToken($invoiceId),
+        'since'       => time(),
+    ];
 
-    $csrfToken = hash_hmac('sha256', $invoiceId . '|' . $amount, $passkey);
+    $qrImage = (($params['showQrCode'] ?? '') === 'on') ? flexpay_qr_image($params, $amount, $accRef, $payNumber, $isTill) : null;
+
+    $e = function ($v) {
+        return htmlspecialchars((string) $v, ENT_QUOTES, 'UTF-8');
+    };
 
     ob_start();
     ?>
-    <div id="flexpay-widget" style="max-width:430px;margin:0 auto;font-family:Arial,sans-serif;">
+    <div id="flexpay-widget" style="max-width:430px;margin:0 auto;font-family:Arial,sans-serif;text-align:left;">
 
       <div style="background:#007229;color:#fff;padding:14px 18px;border-radius:8px 8px 0 0;display:flex;align-items:center;gap:10px;">
-        <svg width="32" height="32" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <svg width="32" height="32" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
           <rect width="100" height="100" rx="12" fill="#fff"/>
           <text x="50" y="68" text-anchor="middle" font-size="40" font-family="Arial" font-weight="bold" fill="#007229">M</text>
         </svg>
@@ -214,29 +320,19 @@ function flexpay_link($params)
           Amount: <strong style="font-size:16px;">KES <?php echo number_format($amount); ?></strong>
         </p>
 
-        <label style="display:block;font-size:13px;font-weight:600;margin-bottom:5px;color:#333;">
+        <label for="flexpay_phone" style="display:block;font-size:13px;font-weight:600;margin-bottom:5px;color:#333;">
           M-Pesa Phone Number
         </label>
-        <input
-          type="tel"
-          id="flexpay_phone"
-          value="<?php echo htmlspecialchars($displayPhone, ENT_QUOTES, 'UTF-8'); ?>"
-          placeholder="0712 345 678"
-          maxlength="13"
-          style="width:100%;padding:9px 12px;border:1px solid #bbb;border-radius:5px;font-size:14px;box-sizing:border-box;"
-        />
+        <input type="tel" id="flexpay_phone" value="<?php echo $e($displayPhone); ?>" placeholder="0712 345 678" maxlength="16" autocomplete="tel"
+               style="width:100%;padding:9px 12px;border:1px solid #bbb;border-radius:5px;font-size:14px;box-sizing:border-box;" />
         <small style="color:#777;font-size:12px;">Safaricom number to receive the payment prompt</small>
 
-        <div id="flexpay-status" style="margin-top:12px;padding:10px 14px;border-radius:5px;font-size:13px;background:#f1f3f4;color:#555;border:1px solid #e0e0e0;">
+        <div id="flexpay-status" role="status" aria-live="polite" style="margin-top:12px;padding:10px 14px;border-radius:5px;font-size:13px;background:#f1f3f4;color:#555;border:1px solid #e0e0e0;">
           &#128270; Watching for your payment — pay via the prompt below, or manually using the <?php echo $isTill ? 'Buy Goods till' : 'Pay Bill'; ?> details. This page updates itself automatically.
         </div>
 
-        <button
-          id="flexpay-pay-btn"
-          onclick="flexpayInitiate()"
-          style="display:block;width:100%;margin-top:16px;padding:11px;background:#007229;color:#fff;
-                 border:none;border-radius:5px;font-size:15px;font-weight:700;cursor:pointer;letter-spacing:.3px;"
-        >
+        <button type="button" id="flexpay-pay-btn"
+                style="display:block;width:100%;margin-top:16px;padding:11px;background:#007229;color:#fff;border:none;border-radius:5px;font-size:15px;font-weight:700;cursor:pointer;letter-spacing:.3px;">
           &#128241; Send M-Pesa Prompt
         </button>
 
@@ -245,20 +341,27 @@ function flexpay_link($params)
           Enter your M-Pesa PIN to complete payment. Prompt expires in 60 seconds.
         </p>
 
+        <?php if ($qrImage): ?>
+        <div style="text-align:center;margin-top:14px;">
+          <img src="data:image/png;base64,<?php echo $qrImage; ?>" alt="M-Pesa QR code" width="180" height="180" style="max-width:180px;height:auto;">
+          <div style="font-size:11px;color:#777;">Or scan with the M-Pesa app (Lipa na M-Pesa → Scan QR)</div>
+        </div>
+        <?php endif; ?>
+
         <details style="margin-top:14px;font-size:12px;color:#888;">
           <summary style="cursor:pointer;">Prefer to pay manually?</summary>
           <?php if ($isTill): ?>
           <p style="margin:8px 0 0;">
             Go to M-Pesa menu → Lipa na M-Pesa → Buy Goods and Services.<br>
-            Till Number: <strong><?php echo htmlspecialchars($shortcode, ENT_QUOTES); ?></strong><br>
+            Till Number: <strong><?php echo $e($payNumber); ?></strong><br>
             Amount: <strong>KES <?php echo number_format($amount); ?></strong><br>
-            <span style="color:#007229;">This page will try to update itself automatically once we detect your payment. If it doesn't within a minute, use "Already Paid?" below.</span>
+            <span style="color:#007229;">Pay from the phone number on your account and this page will update itself automatically. If it doesn't within a minute, use "Already paid?" below.</span>
           </p>
           <?php else: ?>
           <p style="margin:8px 0 0;">
             Go to M-Pesa menu → Lipa Na M-Pesa → Pay Bill.<br>
-            Business No: <strong><?php echo htmlspecialchars($shortcode, ENT_QUOTES); ?></strong><br>
-            Account No: <strong><?php echo htmlspecialchars($accRef, ENT_QUOTES); ?></strong><br>
+            Business No: <strong><?php echo $e($payNumber); ?></strong><br>
+            Account No: <strong><?php echo $e($accRef); ?></strong><br>
             Amount: <strong>KES <?php echo number_format($amount); ?></strong><br>
             <span style="color:#007229;">This page will update itself automatically the moment we receive your payment — no need to reload.</span>
           </p>
@@ -266,37 +369,23 @@ function flexpay_link($params)
         </details>
 
         <div style="margin-top:16px;border-top:1px solid #eee;padding-top:14px;">
-          <button
-            type="button"
-            id="flexpay-verify-toggle"
-            onclick="flexpayToggleVerify()"
-            style="background:none;border:none;color:#007229;font-size:12px;font-weight:600;cursor:pointer;padding:0;text-decoration:underline;"
-          >
+          <button type="button" id="flexpay-verify-toggle"
+                  style="background:none;border:none;color:#007229;font-size:12px;font-weight:600;cursor:pointer;padding:0;text-decoration:underline;">
             Already paid? Verify your payment
           </button>
 
           <div id="flexpay-verify-box" style="display:none;margin-top:10px;">
-            <label style="display:block;font-size:12px;font-weight:600;margin-bottom:5px;color:#333;">
+            <label for="flexpay_verify_ref" style="display:block;font-size:12px;font-weight:600;margin-bottom:5px;color:#333;">
               M-Pesa Receipt Number
             </label>
-            <input
-              type="text"
-              id="flexpay_verify_ref"
-              placeholder="e.g. NLJ7RT61SV"
-              maxlength="40"
-              style="width:100%;padding:8px 10px;border:1px solid #bbb;border-radius:5px;font-size:13px;box-sizing:border-box;text-transform:uppercase;"
-            />
+            <input type="text" id="flexpay_verify_ref" placeholder="e.g. NLJ7RT61SV" maxlength="12" autocomplete="off"
+                   style="width:100%;padding:8px 10px;border:1px solid #bbb;border-radius:5px;font-size:13px;box-sizing:border-box;text-transform:uppercase;" />
             <small style="color:#777;font-size:11px;">Find this in the M-Pesa confirmation SMS you received.</small>
-            <button
-              type="button"
-              id="flexpay-verify-btn"
-              onclick="flexpayVerifyPayment()"
-              style="display:block;width:100%;margin-top:8px;padding:9px;background:#fff;color:#007229;
-                     border:1px solid #007229;border-radius:5px;font-size:13px;font-weight:600;cursor:pointer;"
-            >
+            <button type="button" id="flexpay-verify-btn"
+                    style="display:block;width:100%;margin-top:8px;padding:9px;background:#fff;color:#007229;border:1px solid #007229;border-radius:5px;font-size:13px;font-weight:600;cursor:pointer;">
               Verify Payment
             </button>
-            <div id="flexpay-verify-result" style="display:none;margin-top:8px;padding:8px 10px;border-radius:5px;font-size:12px;"></div>
+            <div id="flexpay-verify-result" role="status" aria-live="polite" style="display:none;margin-top:8px;padding:8px 10px;border-radius:5px;font-size:12px;"></div>
           </div>
         </div>
         <p style="text-align:center;font-size:10px;color:#bbb;margin:14px 0 0;">
@@ -307,248 +396,225 @@ function flexpay_link($params)
 
     <script>
     (function () {
-      var CHECKOUT_URL = <?php echo json_encode($checkoutUrl); ?>;
-      var POLL_URL      = <?php echo json_encode($pollUrl); ?>;
-      var VERIFY_URL    = <?php echo json_encode($verifyUrl); ?>;
-      var RETURN_URL    = <?php echo json_encode($returnUrl); ?>;
-      var INVOICE_ID    = <?php echo json_encode((string) $invoiceId); ?>;
-      var AMOUNT        = <?php echo json_encode((string) $amount); ?>;
-      var SHORTCODE     = <?php echo json_encode($shortcode); ?>;
-      var PASSKEY       = <?php echo json_encode($passkey); ?>;
-      var TXN_TYPE      = <?php echo json_encode($txnType); ?>;
-      var ACC_REF       = <?php echo json_encode(substr($accRef, 0, 12)); ?>;
-      var CALLBACK      = <?php echo json_encode($callbackUrl); ?>;
-      var CSRF          = <?php echo json_encode($csrfToken); ?>;
+      var CFG = <?php echo json_encode($config, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES); ?>;
 
       var pollTimer       = null;
-      var currentCheckout = null;   // null until an STK push has been sent
-      var settled          = false; // stops polling the instant we have a final answer
-      var FAST_INTERVAL   = 3000;   // while actively waiting on an STK prompt
-      var IDLE_INTERVAL    = 6000;  // ambient watch for a manual paybill payment
-
-      // Start watching the moment the page loads — this is what catches a
-      // customer who pays directly via the M-Pesa menu without ever
-      // touching the "Send Prompt" button, and updates the page instantly
-      // once Safaricom's C2B confirmation lands, with zero manual reload.
-      flexpaySchedule(IDLE_INTERVAL);
-
-      window.flexpayInitiate = function () {
-        var rawPhone = document.getElementById('flexpay_phone').value.trim();
-        var phone = flexpayCleanPhone(rawPhone);
-
-        if (!phone) {
-          flexpayStatus('error', '&#9888; Please enter a valid Safaricom phone number.');
-          return;
-        }
-
-        var btn = document.getElementById('flexpay-pay-btn');
-        btn.disabled = true;
-        btn.textContent = 'Sending prompt…';
-        flexpayStatus('info', 'Contacting Safaricom…');
-
-        var body = new URLSearchParams({
-          invoice_id:   INVOICE_ID,
-          amount:       AMOUNT,
-          phone:        phone,
-          shortcode:    SHORTCODE,
-          passkey:      PASSKEY,
-          txn_type:     TXN_TYPE,
-          acc_ref:      ACC_REF,
-          callback_url: CALLBACK,
-          csrf:         CSRF
-        });
-
-        fetch(CHECKOUT_URL, { method: 'POST', body: body })
-          .then(function (r) { return r.json(); })
-          .then(function (data) {
-            if (data.success) {
-              currentCheckout = data.checkout_request_id;
-              flexpayStatus('info', '&#9989; ' + (data.message || 'Prompt sent! Enter your M-Pesa PIN within 60 seconds…'));
-              clearTimeout(pollTimer);
-              flexpaySchedule(FAST_INTERVAL); // switch to fast polling now that a prompt is in flight
-            } else {
-              flexpayStatus('error', '&#10060; ' + (data.message || 'Failed to send prompt. Try again.'));
-              flexpayResetBtn();
-            }
-          })
-          .catch(function () {
-            flexpayStatus('error', '&#10060; Network error reaching Safaricom. Check your connection and try again.');
-            flexpayResetBtn();
-          });
+      var currentCheckout = null;
+      var settled         = false;
+      var startedAt       = Date.now();
+      var FAST_INTERVAL   = 3000;          // while an STK prompt is in flight
+      var IDLE_INTERVAL   = 6000;          // ambient watch for a manual payment
+      var IDLE_GIVE_UP_MS = 30 * 60 * 1000; // stop ambient polling after 30 minutes
+      var ICONS = { queued: '🔎', sent: '📱', processing: '⏳', confirmed: '🎉', failed: '❌' };
+      var STYLES = {
+        info:    'background:#e8f4fd;color:#004085;border:1px solid #b8daff;',
+        success: 'background:#d4edda;color:#155724;border:1px solid #c3e6cb;',
+        error:   'background:#f8d7da;color:#721c24;border:1px solid #f5c6cb;'
       };
 
-      function flexpaySchedule(delay) {
-        if (settled) return;
-        clearTimeout(pollTimer);
-        pollTimer = setTimeout(flexpayCheckStatus, delay);
+      function $(id) { return document.getElementById(id); }
+
+      // Server messages are always inserted as text, never HTML.
+      function show(el, type, msg, base) {
+        el.style.cssText = (STYLES[type] || STYLES.info) + base;
+        el.textContent = msg;
+      }
+      function status(type, msg) {
+        show($('flexpay-status'), type, msg, 'display:block;border-radius:5px;padding:10px 14px;margin-top:12px;font-size:13px;');
+      }
+      function verifyResult(type, msg) {
+        show($('flexpay-verify-result'), type, msg, 'display:block;border-radius:5px;padding:8px 10px;margin-top:8px;font-size:12px;');
       }
 
-      function flexpayCheckStatus() {
+      function cleanPhone(p) {
+        p = String(p).replace(/\D/g, '');
+        if (p.length === 9 && /^[71]/.test(p))       p = '254' + p;
+        else if (p.length === 10 && p.charAt(0) === '0') p = '254' + p.substring(1);
+        return /^254[17]\d{8}$/.test(p) ? p : '';
+      }
+
+      function schedule(delay) {
         if (settled) return;
+        clearTimeout(pollTimer);
+        if (!currentCheckout && Date.now() - startedAt > IDLE_GIVE_UP_MS) return;
+        pollTimer = setTimeout(checkStatus, delay);
+      }
 
-        var url = POLL_URL + '?invoice_id=' + encodeURIComponent(INVOICE_ID);
-        if (currentCheckout) {
-            url += '&checkout_id=' + encodeURIComponent(currentCheckout);
-        }
+      function post(url, data) {
+        return fetch(url, { method: 'POST', body: new URLSearchParams(data), credentials: 'same-origin' })
+          .then(function (r) { return r.json(); });
+      }
 
-        fetch(url, { cache: 'no-store' })
+      function resetBtn() {
+        var btn = $('flexpay-pay-btn');
+        btn.disabled = false;
+        btn.textContent = '📱 Send M-Pesa Prompt';
+        currentCheckout = null;
+        settled = false;
+        startedAt = Date.now();
+        schedule(IDLE_INTERVAL);
+      }
+
+      function checkStatus() {
+        if (settled) return;
+        var url = CFG.pollUrl + '?invoice_id=' + encodeURIComponent(CFG.invoiceId)
+          + '&token=' + encodeURIComponent(CFG.token)
+          + '&since=' + encodeURIComponent(CFG.since);
+        if (currentCheckout) url += '&checkout_id=' + encodeURIComponent(currentCheckout);
+
+        fetch(url, { cache: 'no-store', credentials: 'same-origin' })
           .then(function (r) { return r.json(); })
           .then(function (d) {
             if (settled) return;
-
             if (d.paid) {
               settled = true;
               clearTimeout(pollTimer);
-              var receiptLine = d.receipt ? (' Receipt: ' + d.receipt + '.') : '';
-              flexpayStatus('success', '&#127881; ' + (d.message || 'Payment confirmed!') + receiptLine + ' Reloading…');
-              // Instant reload — no artificial delay. A brief pause only
-              // long enough for the success message to register visually.
-              setTimeout(function () { window.location.href = RETURN_URL; }, 600);
+              status('success', ICONS.confirmed + ' ' + (d.message || 'Payment confirmed!') + (d.receipt ? ' Receipt: ' + d.receipt + '.' : '') + ' Reloading…');
+              setTimeout(function () { window.location.href = CFG.returnUrl; }, 1200);
               return;
             }
-
             if (d.failed) {
               settled = true;
               clearTimeout(pollTimer);
-              flexpayStatus('error', '&#10060; ' + (d.message || 'Payment declined or cancelled.'));
-              flexpayResetBtn();
+              status('error', ICONS.failed + ' ' + (d.message || 'Payment declined or cancelled.'));
+              resetBtn();
               return;
             }
-
-            // Still pending — show the real stage/message and keep watching.
-            flexpayStatus('info', flexpayStageIcon(d.stage) + ' ' + (d.message || 'Waiting for payment…'));
-            flexpaySchedule(currentCheckout ? FAST_INTERVAL : IDLE_INTERVAL);
+            if (currentCheckout || d.stage !== 'queued') {
+              status('info', (ICONS[d.stage] || ICONS.queued) + ' ' + (d.message || 'Waiting for payment…'));
+            }
+            schedule(currentCheckout ? FAST_INTERVAL : IDLE_INTERVAL);
           })
-          .catch(function () {
-            // Transient network hiccup — don't alarm the customer, just retry.
-            flexpaySchedule(currentCheckout ? FAST_INTERVAL : IDLE_INTERVAL);
-          });
+          .catch(function () { schedule(currentCheckout ? FAST_INTERVAL : IDLE_INTERVAL); });
       }
 
-      function flexpayStageIcon(stage) {
-        var icons = {
-          queued:     '&#128270;',
-          sent:       '&#128241;',
-          processing: '&#9203;',
-          confirmed:  '&#127881;',
-          failed:     '&#10060;',
-          unknown:    '&#128270;'
-        };
-        return icons[stage] || '&#128270;';
-      }
-
-      function flexpayCleanPhone(p) {
-        p = p.replace(/\D/g, '');
-        if (p.length === 9)                          return '254' + p;
-        if (p.length === 10 && p.charAt(0) === '0')  return '254' + p.substring(1);
-        if (p.length === 12 && p.substring(0, 3) === '254') return p;
-        if (p.length === 13 && p.charAt(0) === '+')  return p.substring(1);
-        return '';
-      }
-
-      function flexpayStatus(type, msg) {
-        var el = document.getElementById('flexpay-status');
-        var styles = {
-          info:    'background:#e8f4fd;color:#004085;border:1px solid #b8daff;',
-          success: 'background:#d4edda;color:#155724;border:1px solid #c3e6cb;',
-          error:   'background:#f8d7da;color:#721c24;border:1px solid #f5c6cb;',
-          warning: 'background:#fff3cd;color:#856404;border:1px solid #ffeeba;'
-        };
-        el.style.cssText = (styles[type] || styles.info) + 'display:block;border-radius:5px;padding:10px 14px;margin-top:12px;font-size:13px;';
-        el.innerHTML = msg;
-      }
-
-      function flexpayResetBtn() {
-        var btn = document.getElementById('flexpay-pay-btn');
-        btn.disabled = false;
-        btn.textContent = '\uD83D\uDCF1 Send M-Pesa Prompt';
-        settled = false;
-        flexpaySchedule(IDLE_INTERVAL); // resume ambient watching after a failure, in case they pay manually instead
-      }
-
-      window.flexpayToggleVerify = function () {
-        var box = document.getElementById('flexpay-verify-box');
-        var isOpen = box.style.display !== 'none';
-        box.style.display = isOpen ? 'none' : 'block';
-        if (!isOpen) {
-          document.getElementById('flexpay_verify_ref').focus();
-        }
-      };
-
-      window.flexpayVerifyPayment = function () {
-        var refInput = document.getElementById('flexpay_verify_ref');
-        var reference = refInput.value.trim();
-        var resultEl = document.getElementById('flexpay-verify-result');
-        var btn = document.getElementById('flexpay-verify-btn');
-
-        if (!reference) {
-          flexpayVerifyResult('error', 'Please enter your M-Pesa receipt number.');
+      $('flexpay-pay-btn').addEventListener('click', function () {
+        var phone = cleanPhone($('flexpay_phone').value.trim());
+        if (!phone) {
+          status('error', '⚠ Please enter a valid Safaricom phone number (07XX or 01XX).');
           return;
         }
+        var btn = this;
+        btn.disabled = true;
+        btn.textContent = 'Sending prompt…';
+        status('info', 'Contacting Safaricom…');
 
+        post(CFG.checkoutUrl, { invoice_id: CFG.invoiceId, token: CFG.token, phone: phone })
+          .then(function (data) {
+            if (data.success) {
+              currentCheckout = data.checkout_request_id;
+              settled = false;
+              status('info', '✅ ' + (data.message || 'Prompt sent! Enter your M-Pesa PIN within 60 seconds…'));
+              schedule(FAST_INTERVAL);
+            } else {
+              status('error', '❌ ' + (data.message || 'Failed to send prompt. Try again.'));
+              resetBtn();
+            }
+          })
+          .catch(function () {
+            status('error', '❌ Network error. Check your connection and try again.');
+            resetBtn();
+          });
+      });
+
+      $('flexpay-verify-toggle').addEventListener('click', function () {
+        var box = $('flexpay-verify-box');
+        var open = box.style.display !== 'none';
+        box.style.display = open ? 'none' : 'block';
+        if (!open) $('flexpay_verify_ref').focus();
+      });
+
+      $('flexpay-verify-btn').addEventListener('click', function () {
+        var reference = $('flexpay_verify_ref').value.replace(/\s+/g, '').toUpperCase();
+        if (!/^[A-Z0-9]{8,12}$/.test(reference)) {
+          verifyResult('error', 'Please enter the M-Pesa receipt number from your confirmation SMS (e.g. NLJ7RT61SV).');
+          return;
+        }
+        var btn = this;
         btn.disabled = true;
         btn.textContent = 'Checking…';
-        flexpayVerifyResult('info', 'Checking your payment…');
+        verifyResult('info', 'Checking your payment…');
 
-        var body = new URLSearchParams({
-          invoice_id: INVOICE_ID,
-          amount:     AMOUNT,
-          passkey:    PASSKEY,
-          csrf:       CSRF,
-          reference:  reference
-        });
-
-        fetch(VERIFY_URL, { method: 'POST', body: body })
-          .then(function (r) { return r.json(); })
+        post(CFG.verifyUrl, { invoice_id: CFG.invoiceId, token: CFG.token, reference: reference })
           .then(function (data) {
             btn.disabled = false;
             btn.textContent = 'Verify Payment';
-
-            if (data.applied || (data.success && /already been applied/i.test(data.message || ''))) {
-              flexpayVerifyResult('success', '&#9989; ' + data.message);
-              // A payment was just applied (or already was) — trigger an
-              // immediate status check so the whole page reflects it,
-              // same instant-reload behaviour as the main payment flow.
+            if (data.applied || data.already) {
+              verifyResult('success', '✅ ' + data.message);
               settled = false;
-              flexpayCheckStatus();
+              CFG.since = 0; // accept the payment we just applied
+              checkStatus();
             } else if (data.success) {
-              flexpayVerifyResult('info', '&#8987; ' + data.message);
+              verifyResult('info', '⌛ ' + data.message);
+              settled = false;
+              CFG.since = 0;
+              startedAt = Date.now();
+              schedule(FAST_INTERVAL);
             } else {
-              flexpayVerifyResult('error', data.message || 'We could not verify that payment. Please check the receipt number and try again.');
+              verifyResult('error', data.message || 'We could not verify that payment. Please check the receipt number and try again.');
             }
           })
           .catch(function () {
             btn.disabled = false;
             btn.textContent = 'Verify Payment';
-            flexpayVerifyResult('error', 'Network error — please check your connection and try again.');
+            verifyResult('error', 'Network error — please check your connection and try again.');
           });
-      };
+      });
 
-      function flexpayVerifyResult(type, msg) {
-        var el = document.getElementById('flexpay-verify-result');
-        var styles = {
-          info:    'background:#e8f4fd;color:#004085;border:1px solid #b8daff;',
-          success: 'background:#d4edda;color:#155724;border:1px solid #c3e6cb;',
-          error:   'background:#f8d7da;color:#721c24;border:1px solid #f5c6cb;'
-        };
-        el.style.cssText = (styles[type] || styles.info) + 'display:block;border-radius:5px;padding:8px 10px;margin-top:8px;font-size:12px;';
-        el.innerHTML = msg;
-      }
+      // Start watching immediately — catches customers who pay from the
+      // M-Pesa menu without pressing "Send Prompt".
+      schedule(IDLE_INTERVAL);
     }());
     </script>
     <?php
     return ob_get_clean();
 }
 
+/**
+ * Dynamic QR image (base64 PNG) for this invoice, cached for a day so the
+ * invoice page doesn't call Daraja on every view. Returns null on failure —
+ * the QR is a convenience, never a blocker.
+ */
+function flexpay_qr_image(array $params, int $amount, string $accRef, string $payNumber, bool $isTill): ?string
+{
+    $cacheKey = 'qr_' . substr(hash('sha256', implode('|', [$payNumber, $accRef, $amount, $isTill ? 'BG' : 'PB', ($params['testMode'] ?? '')])), 0, 40);
+    $cached   = (string) FlexPayStore::getSetting($cacheKey, '');
+    if ($cached === 'fail') {
+        return null;
+    }
+    if ($cached !== '') {
+        return $cached;
+    }
+
+    $merchant = trim((string) ($params['qrMerchantName'] ?? '')) ?: trim((string) ($params['companyname'] ?? '')) ?: 'Payment';
+
+    $response = DarajaClient::fromGatewayParams($params)->generateQr([
+        'merchantName' => $merchant,
+        'refNo'        => $accRef,
+        'amount'       => $amount,
+        'trxCode'      => $isTill ? 'BG' : 'PB',
+        'cpi'          => $payNumber,
+        'size'         => '300',
+    ]);
+
+    $qr = (string) ($response['QRCode'] ?? '');
+    if ($qr === '' || strlen($qr) > 500000 || !preg_match('/^[A-Za-z0-9+\/=]+$/', $qr)) {
+        FlexPayStore::logApiCall('qr_generate', ['ref' => $accRef, 'amount' => $amount], $response, false, 'system');
+        FlexPayStore::setSetting($cacheKey, 'fail'); // don't retry on every page view
+        return null;
+    }
+
+    FlexPayStore::setSetting($cacheKey, $qr);
+    return $qr;
+}
+
 // ─── Refund via B2C ───────────────────────────────────────────────────────────
 /**
- * Triggered automatically by WHMCS when an admin issues a refund on a
- * paid invoice. Delegates to DarajaClient::b2cPayment and records the
- * attempt in flexpay_refunds for dashboard visibility regardless of the
- * eventual async result.
- *
- * @param array $params
- * @return array
+ * Triggered by WHMCS when an admin refunds a paid invoice. B2C is async:
+ * "success" here means Safaricom accepted the disbursement; the final
+ * outcome arrives at ?route=disbursement_result and is shown on the
+ * dashboard's Refunds tab (a failed refund is also written to the WHMCS
+ * activity log so it can't go unnoticed).
  */
 function flexpay_refund($params)
 {
@@ -557,56 +623,77 @@ function flexpay_refund($params)
         return ['status' => 'error', 'rawdata' => 'FlexPay license is not valid — refund blocked. ' . $license['message']];
     }
 
-    $invoiceId = (int) $params['invoiceid'];
-    $amount    = (int) ceil((float) $params['amount']);
-    $phone     = DarajaClient::formatPhone($params['clientdetails']['phonenumber'] ?? '');
-    $systemUrl = rtrim($params['systemurl'], '/');
-    $origTrans = (string) ($params['transid'] ?? '');
-
-    $b2cShort   = $params['b2cShortcode'] ?: $params['businessShortcode'];
-    $resultUrl  = $systemUrl . '/modules/gateways/callback/flexpay.php?route=disbursement_result';
-    $timeoutUrl = $systemUrl . '/modules/gateways/callback/flexpay.php?route=disbursement_timeout';
-
-    if (strlen($phone) !== 12) {
-        return ['status' => 'error', 'rawdata' => 'Invalid customer phone number: ' . $phone];
+    $initiator = DarajaClient::initiatorCredentials($params);
+    if ($initiator === null) {
+        return ['status' => 'error', 'rawdata' => 'B2C refunds need an Initiator Name and Security Credential in the FlexPay gateway settings.'];
     }
 
-    $client = DarajaClient::fromGatewayParams($params);
+    $invoiceId = (int) $params['invoiceid'];
+    $origTrans = (string) ($params['transid'] ?? '');
 
-    $response = $client->b2cPayment([
-        'initiatorName'      => $params['b2cInitiatorName'],
-        'securityCredential' => $params['b2cSecurityCredential'],
-        'shortcode'          => $b2cShort,
+    // Refund amount arrives in the invoice currency; M-Pesa pays whole KES.
+    $amount = (float) $params['amount'];
+    $invoiceCurrency = FlexPayStore::getInvoiceCurrency($invoiceId);
+    if ($invoiceCurrency && strtoupper((string) $invoiceCurrency->code) !== 'KES') {
+        $kes = FlexPayStore::getCurrencyByCode('KES');
+        if (!$kes) {
+            return ['status' => 'error', 'rawdata' => 'Invoice is not in KES and no KES currency is configured in WHMCS — cannot compute the M-Pesa refund amount.'];
+        }
+        $amount = FlexPayStore::convertAmount($amount, $invoiceCurrency, $kes);
+    }
+    $amount = (int) round($amount);
+    if ($amount < 1) {
+        return ['status' => 'error', 'rawdata' => 'Refund amount rounds to less than KES 1.'];
+    }
+
+    // Refund to the number that actually paid, not whatever is on the
+    // client profile today.
+    $original = FlexPayStore::findTransactionByReceipt($origTrans) ?: FlexPayStore::findTransactionByCheckoutId($origTrans);
+    $phone    = $original ? DarajaClient::formatPhone((string) $original->phone) : '';
+    if ($phone === '') {
+        $phone = DarajaClient::formatPhone((string) ($params['clientdetails']['phonenumber'] ?? ''));
+    }
+    if ($phone === '') {
+        return ['status' => 'error', 'rawdata' => 'No valid Safaricom number found for this refund (paying number unknown and client profile phone is not a Kenyan mobile number).'];
+    }
+
+    $systemUrl = rtrim((string) $params['systemurl'], '/');
+    $response  = DarajaClient::fromGatewayParams($params)->b2cPayment([
+        'initiatorName'      => $initiator['name'],
+        'securityCredential' => $initiator['credential'],
+        'commandId'          => ($params['b2cCommandId'] ?? '') ?: 'BusinessPayment',
+        'shortcode'          => DarajaClient::b2cShortcode($params),
         'amount'             => $amount,
         'phone'              => $phone,
-        'remarks'            => 'Refund Invoice #' . $invoiceId,
+        'remarks'            => 'Refund Invoice ' . $invoiceId,
         'occasion'           => 'INV-' . $invoiceId,
-        'resultUrl'          => $resultUrl,
-        'timeoutUrl'         => $timeoutUrl,
+        'resultUrl'          => FlexPaySecurity::callbackUrl($systemUrl, 'disbursement_result'),
+        'timeoutUrl'         => FlexPaySecurity::callbackUrl($systemUrl, 'disbursement_timeout'),
     ]);
 
-    $success = isset($response['ResponseCode']) && (string) $response['ResponseCode'] === '0';
-
+    $success = DarajaClient::isAccepted($response);
     FlexPayStore::logApiCall('b2c', ['invoice' => $invoiceId, 'amount' => $amount, 'phone' => $phone], $response, $success, 'system');
 
-    $conversationId = $response['ConversationID'] ?? '';
+    $conversationId = (string) ($response['ConversationID'] ?? '');
+    $originatorId   = (string) ($response['OriginatorConversationID'] ?? '');
 
     FlexPayStore::recordRefund([
-        'invoice_id'         => $invoiceId,
-        'original_trans_id'  => $origTrans,
-        'conversation_id'    => $conversationId,
-        'phone'              => $phone,
-        'amount'             => $amount,
-        'status'             => $success ? 'pending' : 'failed',
-        'result_desc'        => $response['ResponseDescription'] ?? ($response['errorMessage'] ?? ''),
-        'initiated_by'       => $_SESSION['adminusername'] ?? 'system',
+        'invoice_id'                 => $invoiceId,
+        'original_trans_id'          => $origTrans,
+        'conversation_id'            => $conversationId,
+        'originator_conversation_id' => $originatorId,
+        'phone'                      => $phone,
+        'amount'                     => $amount,
+        'status'                     => $success ? 'pending' : 'failed',
+        'result_desc'                => substr($success ? 'Accepted by Safaricom — awaiting result.' : DarajaClient::errorMessage($response), 0, 255),
+        'initiated_by'               => FlexPayStore::currentAdminUsername(),
     ]);
 
     if ($success) {
         return [
             'status'  => 'success',
             'rawdata' => $response,
-            'transid' => $conversationId,
+            'transid' => $conversationId ?: $originatorId,
             'fees'    => 0,
         ];
     }
@@ -618,104 +705,37 @@ function flexpay_refund($params)
 // Intelligent C2B auto-registration
 // ═════════════════════════════════════════════════════════════════════════════
 /**
- * Automatically (re)registers C2B Validation/Confirmation URLs with Daraja
- * whenever the relevant configuration changes — no manual "click to
- * register" step required, unlike a typical static integration.
- *
- * Change detection: we hash {shortcode}|{systemUrl}|{sandbox-flag} and
- * compare against the last-registered hash stored in flexpay_settings.
- * Registration only fires Safaricom-side when that hash differs, which
- * means:
- *   - First page load after activation → registers once.
- *   - Admin changes shortcode or domain → re-registers automatically
- *     on the next invoice view, with zero manual steps.
- *   - Every other page load → a single fast DB read, no Daraja call.
- *
- * Failures are logged to flexpay_api_log but never interrupt invoice
- * rendering — registration retries automatically on the next load.
- *
- * @param  array $params  WHMCS gateway params
- * @return void
+ * Registers C2B URLs whenever the shortcode, domain or environment changes.
+ * See FlexPayService::registerC2B() for change detection and backoff.
  */
-function flexpay_autoRegisterC2B(array $params): void
+function flexpay_autoRegisterC2B(array $params, bool $force = false, string $actor = 'system (auto)'): array
 {
-    if (($params['autoRegisterC2B'] ?? 'on') !== 'on') {
-        return; // admin explicitly disabled auto-registration
-    }
-
-    $shortcode = $params['c2bShortcode'] ?: $params['businessShortcode'];
-    if (empty($shortcode) || empty($params['consumerKey']) || empty($params['consumerSecret'])) {
-        return; // not configured yet — nothing to register
-    }
-
-    $systemUrl = rtrim($params['systemurl'], '/');
-    $sandboxFlag = ($params['testMode'] === 'on') ? 'sandbox' : 'live';
-    $currentHash = md5($shortcode . '|' . $systemUrl . '|' . $sandboxFlag);
-
-    $lastHash = FlexPayStore::getSetting('c2b_registration_hash');
-
-    if ($lastHash === $currentHash) {
-        return; // already registered for this exact configuration
-    }
-
-    $client = DarajaClient::fromGatewayParams($params);
-
-    $validationUrl  = $systemUrl . '/modules/gateways/callback/flexpay.php?route=c2b_check';
-    $confirmationUrl = $systemUrl . '/modules/gateways/callback/flexpay.php?route=c2b_receipt';
-
-    $response = $client->c2bRegisterUrl([
-        'shortcode'       => $shortcode,
-        'responseType'    => 'Completed',
-        'validationUrl'   => $validationUrl,
-        'confirmationUrl' => $confirmationUrl,
-    ]);
-
-    $success = isset($response['ResponseCode']) && (string) $response['ResponseCode'] === '0';
-
-    FlexPayStore::logApiCall(
-        'c2b_register',
-        ['shortcode' => $shortcode, 'validationUrl' => $validationUrl, 'confirmationUrl' => $confirmationUrl],
-        $response,
-        $success,
-        'system (auto)'
-    );
-
-    // Only remember success — a failed attempt should retry on next load
-    // rather than being silently treated as "done".
-    if ($success) {
-        FlexPayStore::setSetting('c2b_registration_hash', $currentHash);
-        FlexPayStore::setSetting('c2b_registration_last_success', date('Y-m-d H:i:s'));
-    }
+    return FlexPayService::registerC2B($params, $force, $actor);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// License enforcement display
+// Customer-facing notices
 // ═════════════════════════════════════════════════════════════════════════════
 /**
- * Renders a clear, non-technical message in place of the payment widget
- * when FlexPay's own commercial license is invalid, expired, suspended,
- * or unconfigured. Shown to the SITE ADMIN's customers, so the wording
- * is deliberately generic (never exposes licensing internals) while the
- * real diagnostic detail goes to the admin via the dashboard instead.
- *
- * @param  array $license  Result from FlexPayLicense::check()
- * @param  array $params   WHMCS gateway params
- * @return string
+ * Shown instead of the payment widget when FlexPay's license is invalid.
+ * Generic wording for customers; the diagnostic detail is on the dashboard.
  */
 function flexpay_render_license_block(array $license, array $params): string
 {
-    FlexPayStore::logApiCall('license_block', ['status' => $license['status'] ?? 'unknown'], $license, false, 'system');
+    // Log at most once an hour — this runs on every invoice view.
+    if (time() - (int) FlexPayStore::getSetting('license_block_logged', 0) > 3600) {
+        FlexPayStore::setSetting('license_block_logged', time());
+        FlexPayStore::logApiCall('license_block', ['status' => $license['status'] ?? 'unknown'], $license, false, 'system');
+    }
 
-    ob_start();
-    ?>
-    <div style="max-width:430px;margin:0 auto;font-family:Arial,sans-serif;">
-        <div style="border:1px solid #f5c6cb;background:#fff8f8;border-radius:8px;padding:20px;text-align:center;">
-            <div style="font-size:32px;margin-bottom:8px;">&#9888;</div>
-            <p style="margin:0;color:#721c24;font-size:14px;">
-                M-Pesa payment is temporarily unavailable. Please try another payment method, or contact us if this continues.
-            </p>
-        </div>
-    </div>
-    <?php
-    return ob_get_clean();
+    return flexpay_render_notice('M-Pesa payment is temporarily unavailable. Please try another payment method, or contact us if this continues.');
+}
+
+function flexpay_render_notice(string $message): string
+{
+    return '<div style="max-width:430px;margin:0 auto;font-family:Arial,sans-serif;">'
+        . '<div style="border:1px solid #f5c6cb;background:#fff8f8;border-radius:8px;padding:20px;text-align:center;">'
+        . '<div style="font-size:32px;margin-bottom:8px;">&#9888;</div>'
+        . '<p style="margin:0;color:#721c24;font-size:14px;">' . htmlspecialchars($message, ENT_QUOTES, 'UTF-8') . '</p>'
+        . '</div></div>';
 }

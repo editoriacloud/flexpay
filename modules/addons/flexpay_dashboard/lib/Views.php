@@ -38,7 +38,7 @@ class FlexPayViews
             $badge = '';
 
             if ($key === 'reconciliation') {
-                $count = count(FlexPayStore::listUnmatched(true));
+                $count = FlexPayStore::countUnmatched();
                 $badge = ' <span id="fp-nav-reconcile-badge" style="background:#dc3545;color:#fff;border-radius:10px;padding:1px 7px;font-size:11px;margin-left:4px;'
                     . ($count > 0 ? '' : 'display:none;') . '">' . $count . '</span>';
             }
@@ -109,12 +109,15 @@ class FlexPayViews
      */
     public static function renderLivePollingScript(string $modulelink): string
     {
-        $liveUrl = htmlspecialchars($modulelink, ENT_QUOTES) . '&fp_tab=live_data';
+        // Raw URL, JSON-encoded for a JS string. (v3.4 HTML-escaped it first,
+        // so the browser requested "...&amp;fp_tab=live_data" and live
+        // updates never worked.)
+        $liveUrl = $modulelink . '&fp_tab=live_data';
 
         return '
         <script>
         (function () {
-            var FP_LIVE_URL = ' . json_encode($liveUrl) . ';
+            var FP_LIVE_URL = ' . json_encode($liveUrl, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES) . ';
             var FP_POLL_MS = 8000;
             var fpSeenLatestId = null;
             var fpNewCount = 0;
@@ -128,6 +131,7 @@ class FlexPayViews
                     .then(function (r) { return r.json(); })
                     .then(function (data) {
                         if (!data || !data.success) return;
+                        if (document.hidden) return;
                         fpUpdateOverview(data);
                         fpUpdateBadge(data.stats.unmatched_count);
                         fpUpdateTransactionsBanner(data.transactions);
@@ -210,6 +214,28 @@ class FlexPayViews
         return '<div class="fp-alert ' . $class . '">' . $icon . ' ' . htmlspecialchars($result['message']) . '</div>';
     }
 
+    /** Shorthand HTML escaper. */
+    private static function e($value): string
+    {
+        return htmlspecialchars((string) $value, ENT_QUOTES, 'UTF-8');
+    }
+
+    /** Phones may be full numbers, masked, or (C2B v2) SHA-256 hashes. */
+    private static function displayPhone(string $phone): string
+    {
+        if (preg_match('/^[a-f0-9]{64}$/i', $phone)) {
+            return 'hashed …' . substr($phone, -6);
+        }
+        return DarajaClient::toDisplayPhone($phone);
+    }
+
+    private static function invoiceLink($invoiceId): string
+    {
+        return $invoiceId
+            ? '<a href="invoices.php?action=edit&amp;id=' . (int) $invoiceId . '" target="_blank" rel="noopener">#' . (int) $invoiceId . '</a>'
+            : '<span style="color:#999;">—</span>';
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // Overview tab
     // ─────────────────────────────────────────────────────────────────────
@@ -218,24 +244,31 @@ class FlexPayViews
     {
         $stats = FlexPayStore::getStats($days);
         $gw    = FlexPayStore::getFlexPayGatewayParams();
+        $link  = self::e($modulelink);
+
+        $html = '';
 
         $license = FlexPayLicense::check($gw);
-        $licenseHtml = '';
         if (!$license['valid']) {
-            $licenseHtml = '<div class="fp-card" style="border-color:#f5c6cb;background:#fff8f8;margin-bottom:16px;">'
-                . '<strong style="color:#721c24;">&#9888; FlexPay License Issue: ' . htmlspecialchars($license['status']) . '</strong><br>'
-                . '<span style="font-size:13px;color:#721c24;">' . htmlspecialchars($license['message']) . '</span> '
-                . '<a href="' . htmlspecialchars($modulelink) . '&fp_tab=tools" style="font-size:13px;color:#007229;font-weight:600;">Go to Tools to re-check &rarr;</a>'
+            $html .= '<div class="fp-card" style="border-color:#f5c6cb;background:#fff8f8;margin-bottom:16px;">'
+                . '<strong style="color:#721c24;">&#9888; FlexPay License Issue: ' . self::e($license['status']) . '</strong><br>'
+                . '<span style="font-size:13px;color:#721c24;">' . self::e($license['message']) . '</span> '
+                . '<a href="' . $link . '&amp;fp_tab=tools" style="font-size:13px;color:#007229;font-weight:600;">Go to Tools to re-check &rarr;</a>'
                 . '</div>';
         }
 
-        $modeLabel = (($gw['testMode'] ?? '') === 'on')
+        if (($gw['callbackSecurity'] ?? 'token_or_ip') === 'off') {
+            $html .= '<div class="fp-alert fp-alert-error">&#9888; <strong>Callback security is OFF.</strong> Anyone can send FlexPay a fake "payment received" notification. Change <em>Callback Security</em> in the gateway settings.</div>';
+        }
+
+        $note = (string) FlexPayStore::getSetting('c2b_registration_note', '');
+        if ($note !== '') {
+            $html .= '<div class="fp-alert" style="background:#fff3cd;color:#856404;border:1px solid #ffeeba;">&#9432; ' . self::e($note) . '</div>';
+        }
+
+        $html .= '<div style="margin-bottom:16px;">' . ((($gw['testMode'] ?? '') === 'on')
             ? '<span class="fp-badge fp-badge-pending">SANDBOX MODE</span>'
-            : '<span class="fp-badge fp-badge-success">LIVE MODE</span>';
-
-        $lastBalance = FlexPayStore::getLatestBalance($gw['businessShortcode'] ?? '');
-
-        $html = $licenseHtml . '<div style="margin-bottom:16px;">' . $modeLabel . '</div>';
+            : '<span class="fp-badge fp-badge-success">LIVE MODE</span>') . '</div>';
 
         $html .= '<div class="fp-grid" style="grid-template-columns:repeat(auto-fit, minmax(180px, 1fr));margin-bottom:24px;">';
 
@@ -249,29 +282,30 @@ class FlexPayViews
         ];
 
         foreach ($cards as [$label, $value, $color, $liveId]) {
-            $html .= '<div class="fp-card"><div class="fp-stat-label">' . htmlspecialchars($label) . '</div>'
+            $html .= '<div class="fp-card"><div class="fp-stat-label">' . self::e($label) . '</div>'
                 . '<div class="fp-stat-value" style="color:' . $color . ';" id="' . $liveId . '">' . $value . '</div></div>';
         }
 
         $html .= '</div>';
 
-        $html .= '<div style="font-size:13px;color:#888;margin-bottom:18px;">Showing activity for the last ' . $days . ' days. STK Push successes: <strong>' . $stats['stk_count'] . '</strong> &nbsp;|&nbsp; C2B successes: <strong>' . $stats['c2b_count'] . '</strong></div>';
+        $html .= '<div style="font-size:13px;color:#888;margin-bottom:18px;">Showing activity for the last ' . (int) $days . ' days. STK Push successes: <strong>' . (int) $stats['stk_count'] . '</strong> &nbsp;|&nbsp; C2B successes: <strong>' . (int) $stats['c2b_count'] . '</strong></div>';
 
+        $lastBalance = FlexPayStore::getLatestBalance(DarajaClient::c2bShortcode($gw));
         if ($lastBalance) {
-            $html .= '<div class="fp-card" style="margin-bottom:18px;">';
-            $html .= '<div style="font-weight:600;margin-bottom:10px;">Latest Account Balance <span style="font-size:11px;color:#999;font-weight:400;">(as of ' . htmlspecialchars($lastBalance->created_at) . ')</span></div>';
-            $html .= '<div style="display:flex;gap:30px;flex-wrap:wrap;">';
-            $html .= '<div><div class="fp-stat-label">Working Account</div><div style="font-size:18px;font-weight:700;" id="fp-live-balance-working">KES ' . number_format($lastBalance->working_account, 2) . '</div></div>';
-            $html .= '<div><div class="fp-stat-label">Utility Account</div><div style="font-size:18px;font-weight:700;" id="fp-live-balance-utility">KES ' . number_format($lastBalance->utility_account, 2) . '</div></div>';
-            $html .= '</div></div>';
+            $html .= '<div class="fp-card" style="margin-bottom:18px;">'
+                . '<div style="font-weight:600;margin-bottom:10px;">Latest Account Balance <span style="font-size:11px;color:#999;font-weight:400;">(as of ' . self::e($lastBalance->created_at) . ')</span></div>'
+                . '<div style="display:flex;gap:30px;flex-wrap:wrap;">'
+                . '<div><div class="fp-stat-label">Working Account</div><div style="font-size:18px;font-weight:700;" id="fp-live-balance-working">KES ' . number_format((float) $lastBalance->working_account, 2) . '</div></div>'
+                . '<div><div class="fp-stat-label">Utility Account</div><div style="font-size:18px;font-weight:700;" id="fp-live-balance-utility">KES ' . number_format((float) $lastBalance->utility_account, 2) . '</div></div>'
+                . '</div></div>';
         } else {
-            $html .= '<div class="fp-card" style="margin-bottom:18px;color:#888;font-size:13px;">No balance snapshot yet. Visit the <a href="' . htmlspecialchars($modulelink) . '&fp_tab=balance">Balance tab</a> to request one.</div>';
+            $html .= '<div class="fp-card" style="margin-bottom:18px;color:#888;font-size:13px;">No balance snapshot yet. Visit the <a href="' . $link . '&amp;fp_tab=balance">Balance tab</a> to request one.</div>';
         }
 
         if ($stats['unmatched_count'] > 0) {
             $html .= '<div class="fp-card" style="border-color:#f5c6cb;background:#fff8f8;">'
-                . '<strong>&#9888; ' . $stats['unmatched_count'] . ' C2B payment(s) need reconciliation.</strong> '
-                . '<a href="' . htmlspecialchars($modulelink) . '&fp_tab=reconciliation" class="fp-btn" style="margin-left:10px;">Review now</a>'
+                . '<strong>&#9888; ' . (int) $stats['unmatched_count'] . ' payment(s) need reconciliation.</strong> '
+                . '<a href="' . $link . '&amp;fp_tab=reconciliation" class="fp-btn" style="margin-left:10px;">Review now</a>'
                 . '</div>';
         }
 
@@ -284,41 +318,47 @@ class FlexPayViews
 
     public static function renderTransactions(string $modulelink, array $get): string
     {
+        $perPage = 25;
         $page    = max(1, (int) ($get['page'] ?? 1));
         $filters = [
-            'channel' => $get['channel'] ?? '',
-            'status'  => $get['status']  ?? '',
-            'search'  => $get['search']  ?? '',
+            'channel'   => (string) ($get['channel'] ?? ''),
+            'status'    => (string) ($get['status'] ?? ''),
+            'search'    => substr((string) ($get['search'] ?? ''), 0, 60),
+            'date_from' => preg_match('/^\d{4}-\d{2}-\d{2}$/', (string) ($get['date_from'] ?? '')) ? $get['date_from'] : '',
+            'date_to'   => preg_match('/^\d{4}-\d{2}-\d{2}$/', (string) ($get['date_to'] ?? '')) ? $get['date_to'] : '',
         ];
 
-        $result = FlexPayStore::listTransactions($filters, $page, 25);
+        $result = FlexPayStore::listTransactions($filters, $page, $perPage);
         $rows   = $result['data'];
         $total  = $result['total'];
-        $pages  = max(1, (int) ceil($total / 25));
+        $pages  = max(1, (int) ceil($total / $perPage));
+        $link   = self::e($modulelink);
 
         $html = '<div id="fp-new-transactions-banner" style="display:none;align-items:center;justify-content:space-between;background:#e8f4fd;border:1px solid #b8daff;color:#004085;padding:10px 14px;border-radius:6px;margin-bottom:14px;font-size:13px;">'
             . '<span>&#128276; <span class="fp-new-count">0</span> new transaction(s) have arrived since you opened this page.</span>'
-            . '<a href="' . htmlspecialchars($modulelink) . '&fp_tab=transactions" class="fp-btn" style="padding:5px 12px;">Refresh</a>'
+            . '<a href="' . $link . '&amp;fp_tab=transactions" class="fp-btn" style="padding:5px 12px;">Refresh</a>'
             . '</div>';
 
-        $html .= '<form method="get" style="margin-bottom:16px;display:flex;gap:10px;flex-wrap:wrap;align-items:center;">';
-        $html .= '<input type="hidden" name="module" value="flexpay_dashboard">';
-        $html .= '<input type="hidden" name="fp_tab" value="transactions">';
-        $html .= '<input class="fp-input" type="text" name="search" placeholder="Search receipt, phone, reference…" value="' . htmlspecialchars($filters['search']) . '">';
+        $html .= '<form method="get" action="addonmodules.php" style="margin-bottom:16px;display:flex;gap:10px;flex-wrap:wrap;align-items:center;">'
+            . '<input type="hidden" name="module" value="flexpay_dashboard">'
+            . '<input type="hidden" name="fp_tab" value="transactions">'
+            . '<input class="fp-input" type="text" name="search" placeholder="Search receipt, phone, reference…" value="' . self::e($filters['search']) . '">';
+
         $html .= '<select class="fp-input" name="channel"><option value="">All Channels</option>';
         foreach (['stk' => 'STK Push', 'c2b' => 'C2B', 'b2c' => 'B2C / Refund', 'reversal' => 'Reversal'] as $val => $label) {
-            $sel = ($filters['channel'] === $val) ? ' selected' : '';
-            $html .= '<option value="' . $val . '"' . $sel . '>' . $label . '</option>';
+            $html .= '<option value="' . $val . '"' . ($filters['channel'] === $val ? ' selected' : '') . '>' . $label . '</option>';
         }
-        $html .= '</select>';
-        $html .= '<select class="fp-input" name="status"><option value="">All Statuses</option>';
+        $html .= '</select><select class="fp-input" name="status"><option value="">All Statuses</option>';
         foreach (['success' => 'Success', 'failed' => 'Failed', 'pending' => 'Pending', 'reversed' => 'Reversed'] as $val => $label) {
-            $sel = ($filters['status'] === $val) ? ' selected' : '';
-            $html .= '<option value="' . $val . '"' . $sel . '>' . $label . '</option>';
+            $html .= '<option value="' . $val . '"' . ($filters['status'] === $val ? ' selected' : '') . '>' . $label . '</option>';
         }
-        $html .= '</select>';
-        $html .= '<button type="submit" class="fp-btn">Filter</button>';
-        $html .= '</form>';
+        $html .= '</select>'
+            . '<input class="fp-input" type="date" name="date_from" value="' . self::e($filters['date_from']) . '" title="From">'
+            . '<input class="fp-input" type="date" name="date_to" value="' . self::e($filters['date_to']) . '" title="To">'
+            . '<button type="submit" class="fp-btn">Filter</button>'
+            . '<a class="fp-btn fp-btn-outline" href="addonmodules.php?' . self::e(http_build_query(array_merge($filters, ['module' => 'flexpay_dashboard', 'fp_tab' => 'export']))) . '">&#11015; Export CSV</a>'
+            . '<span style="font-size:12px;color:#888;">' . number_format($total) . ' result(s)</span>'
+            . '</form>';
 
         $html .= '<table class="fp-table"><thead><tr>'
             . '<th>Date</th><th>Channel</th><th>Receipt</th><th>Phone</th><th>Reference</th>'
@@ -329,19 +369,15 @@ class FlexPayViews
         }
 
         foreach ($rows as $row) {
-            $invoiceLink = $row->invoice_id
-                ? '<a href="invoices.php?action=edit&id=' . (int) $row->invoice_id . '" target="_blank">#' . (int) $row->invoice_id . '</a>'
-                : '<span style="color:#999;">—</span>';
-
-            $html .= '<tr>'
-                . '<td>' . htmlspecialchars($row->created_at) . '</td>'
-                . '<td>' . htmlspecialchars(strtoupper($row->channel)) . '</td>'
-                . '<td>' . htmlspecialchars($row->mpesa_receipt ?: '—') . '</td>'
-                . '<td>' . htmlspecialchars(DarajaClient::toDisplayPhone($row->phone ?: '')) . '</td>'
-                . '<td>' . htmlspecialchars($row->account_reference ?: '—') . '</td>'
+            $html .= '<tr title="' . self::e($row->result_desc) . '">'
+                . '<td>' . self::e($row->created_at) . '</td>'
+                . '<td>' . self::e(strtoupper($row->channel)) . ($row->direction === 'out' ? ' <span style="color:#c0392b;">&#8599;</span>' : '') . '</td>'
+                . '<td>' . self::e($row->mpesa_receipt ?: '—') . '</td>'
+                . '<td>' . self::e(self::displayPhone((string) $row->phone)) . '</td>'
+                . '<td>' . self::e($row->account_reference ?: '—') . '</td>'
                 . '<td>KES ' . number_format((float) $row->amount, 2) . '</td>'
-                . '<td>' . $invoiceLink . '</td>'
-                . '<td>' . self::statusBadge($row->status) . '</td>'
+                . '<td>' . self::invoiceLink($row->invoice_id) . '</td>'
+                . '<td>' . self::statusBadge((string) $row->status) . '</td>'
                 . '<td>' . self::outcomeBadge($row->payment_outcome ?? null) . '</td>'
                 . '</tr>';
         }
@@ -349,11 +385,18 @@ class FlexPayViews
         $html .= '</tbody></table>';
 
         if ($pages > 1) {
-            $html .= '<div style="margin-top:16px;display:flex;gap:6px;">';
-            for ($p = 1; $p <= $pages; $p++) {
-                $isActive = ($p === $page);
+            $html .= '<div style="margin-top:16px;display:flex;gap:6px;flex-wrap:wrap;align-items:center;">';
+            // Windowed pagination: first, last, and ±3 around the current page.
+            $shown = array_unique(array_merge([1, $pages], range(max(1, $page - 3), min($pages, $page + 3))));
+            sort($shown);
+            $prev = 0;
+            foreach ($shown as $p) {
+                if ($prev && $p > $prev + 1) {
+                    $html .= '<span style="color:#999;">…</span>';
+                }
                 $qs = http_build_query(array_merge($filters, ['page' => $p, 'module' => 'flexpay_dashboard', 'fp_tab' => 'transactions']));
-                $html .= '<a href="addonmodules.php?' . $qs . '" class="fp-btn ' . ($isActive ? '' : 'fp-btn-outline') . '" style="padding:5px 10px;">' . $p . '</a>';
+                $html .= '<a href="addonmodules.php?' . self::e($qs) . '" class="fp-btn ' . ($p === $page ? '' : 'fp-btn-outline') . '" style="padding:5px 10px;">' . $p . '</a>';
+                $prev = $p;
             }
             $html .= '</div>';
         }
@@ -369,16 +412,10 @@ class FlexPayViews
             'pending'  => 'fp-badge-pending',
             'reversed' => 'fp-badge-reversed',
         ];
-        $class = $map[$status] ?? 'fp-badge-pending';
-        return '<span class="fp-badge ' . $class . '">' . htmlspecialchars(strtoupper($status)) . '</span>';
+        return '<span class="fp-badge ' . ($map[$status] ?? 'fp-badge-pending') . '">' . self::e(strtoupper($status)) . '</span>';
     }
 
-    /**
-     * Visual indicator for partial/overpaid/possible-partial outcomes —
-     * see FlexPayStore::classifyPaymentOutcome() for how these are
-     * derived. Returns an empty string for 'exact' or unknown/null, since
-     * a fully-paid invoice needs no special callout.
-     */
+    /** Badge for partial / overpaid / possible-partial outcomes; blank for exact. */
     public static function outcomeBadge(?string $outcome): string
     {
         $map = [
@@ -392,7 +429,7 @@ class FlexPayViews
         }
 
         [$class, $label] = $map[$outcome];
-        return '<span class="fp-badge ' . $class . '">' . htmlspecialchars($label) . '</span>';
+        return '<span class="fp-badge ' . $class . '">' . self::e($label) . '</span>';
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -403,32 +440,43 @@ class FlexPayViews
     {
         $refunds = FlexPayStore::listRefunds(100);
 
-        $html = '<p style="color:#888;font-size:13px;margin-bottom:14px;">Refunds are triggered automatically when an admin issues a WHMCS refund on a paid M-Pesa invoice (via Billing → Invoices → Refund). This list tracks every B2C disbursement attempt and its outcome.</p>';
+        $html = '<p style="color:#888;font-size:13px;margin-bottom:14px;">Refunds are sent automatically (M-Pesa B2C) when you refund a paid M-Pesa invoice in WHMCS (Billing → Invoices → Refund), to the phone number that originally paid. '
+            . 'A <strong>failed</strong> refund means WHMCS recorded it but no money reached the customer — use <em>Retry</em> once the cause is fixed (for example, after topping up your B2C account).</p>';
 
         $html .= '<table class="fp-table"><thead><tr>'
             . '<th>Date</th><th>Invoice</th><th>Phone</th><th>Amount</th><th>Original Receipt</th>'
-            . '<th>Conversation ID</th><th>Status</th><th>Initiated By</th></tr></thead><tbody>';
+            . '<th>Status</th><th>Result</th><th>Initiated By</th><th></th></tr></thead><tbody>';
 
         if (empty($refunds)) {
-            $html .= '<tr><td colspan="8" style="text-align:center;color:#999;padding:24px;">No refunds have been processed yet.</td></tr>';
+            $html .= '<tr><td colspan="9" style="text-align:center;color:#999;padding:24px;">No refunds have been processed yet.</td></tr>';
         }
 
         foreach ($refunds as $r) {
+            $action = '';
+            if ($r->status === 'failed' && $r->retried_as === null) {
+                $action = '<form method="post" style="margin:0;">' . FlexPaySecurity::csrfField()
+                    . '<input type="hidden" name="fp_action" value="retry_refund">'
+                    . '<input type="hidden" name="refund_id" value="' . (int) $r->id . '">'
+                    . '<button type="submit" class="fp-btn" style="padding:4px 10px;" onclick="return confirm(\'Send KES ' . number_format((float) $r->amount, 2) . ' to ' . self::e(DarajaClient::toDisplayPhone((string) $r->phone)) . ' again?\');">Retry</button>'
+                    . '</form>';
+            } elseif ($r->retried_as) {
+                $action = '<span style="font-size:11px;color:#888;">retried</span>';
+            }
+
             $html .= '<tr>'
-                . '<td>' . htmlspecialchars($r->created_at) . '</td>'
-                . '<td><a href="invoices.php?action=edit&id=' . (int) $r->invoice_id . '" target="_blank">#' . (int) $r->invoice_id . '</a></td>'
-                . '<td>' . htmlspecialchars(DarajaClient::toDisplayPhone($r->phone)) . '</td>'
+                . '<td>' . self::e($r->created_at) . '</td>'
+                . '<td>' . self::invoiceLink($r->invoice_id) . '</td>'
+                . '<td>' . self::e(DarajaClient::toDisplayPhone((string) $r->phone)) . '</td>'
                 . '<td>KES ' . number_format((float) $r->amount, 2) . '</td>'
-                . '<td>' . htmlspecialchars($r->original_trans_id ?: '—') . '</td>'
-                . '<td style="font-size:11px;color:#888;">' . htmlspecialchars($r->conversation_id ?: '—') . '</td>'
-                . '<td>' . self::statusBadge($r->status) . '</td>'
-                . '<td>' . htmlspecialchars($r->initiated_by ?: '—') . '</td>'
+                . '<td>' . self::e($r->original_trans_id ?: '—') . '</td>'
+                . '<td>' . self::statusBadge((string) $r->status) . '</td>'
+                . '<td style="font-size:11px;color:#666;max-width:260px;">' . self::e($r->result_desc ?: '—') . '</td>'
+                . '<td>' . self::e($r->initiated_by ?: '—') . '</td>'
+                . '<td>' . $action . '</td>'
                 . '</tr>';
         }
 
-        $html .= '</tbody></table>';
-
-        return $html;
+        return $html . '</tbody></table>';
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -439,54 +487,50 @@ class FlexPayViews
     {
         $items = FlexPayStore::listUnmatched(true);
 
-        $html = '<p style="color:#888;font-size:13px;margin-bottom:14px;">These C2B payments arrived with an account reference that didn\'t match an open WHMCS invoice (commonly a typo, e.g. customer entered "INV42" instead of "INV-42", or paid against an already-settled invoice). Match each one to the correct invoice below — the payment will be applied exactly as if it had matched automatically.</p>';
+        $html = '<p style="color:#888;font-size:13px;margin-bottom:14px;">These payments could not be matched to an open invoice automatically (typo\'d account number, Till payment from an unknown phone, already-paid invoice, …). '
+            . 'Apply each one to the right invoice — it is recorded exactly as if it had matched automatically — or dismiss payments that aren\'t for any invoice.</p>';
 
         if (empty($items)) {
-            $html .= '<div class="fp-card" style="text-align:center;color:#888;padding:30px;">&#9989; No unmatched payments. Everything is reconciled.</div>';
-            return $html;
+            return $html . '<div class="fp-card" style="text-align:center;color:#888;padding:30px;">&#9989; No unmatched payments. Everything is reconciled.</div>';
         }
 
         $html .= '<table class="fp-table"><thead><tr>'
             . '<th>Date</th><th>Receipt</th><th>Phone</th><th>Customer Name</th><th>Entered Reference</th>'
-            . '<th>Amount</th><th>Match to Invoice</th></tr></thead><tbody>';
+            . '<th>Amount</th><th>Match to Invoice</th><th></th></tr></thead><tbody>';
 
         foreach ($items as $item) {
-            $hint = trim((string) ($item->notes ?? ''));
-            $suggestedInvoiceId = '';
-
-            // If the hint names exactly one invoice (e.g. "...toward: #42
-            // (balance KES 500.00)."), pre-fill it to save typing — the
-            // admin still has to actively click Apply, this never submits
-            // on its own.
-            if ($hint && preg_match_all('/#(\d+)/', $hint, $m) && count(array_unique($m[1])) === 1) {
-                $suggestedInvoiceId = $m[1][0];
-            }
+            $hint      = trim((string) ($item->notes ?? ''));
+            $suggested = $item->suggested_invoice_id ? (int) $item->suggested_invoice_id : '';
 
             $html .= '<tr>'
-                . '<td>' . htmlspecialchars($item->created_at) . '</td>'
-                . '<td>' . htmlspecialchars($item->trans_id) . '</td>'
-                . '<td>' . htmlspecialchars(DarajaClient::toDisplayPhone($item->phone)) . '</td>'
-                . '<td>' . htmlspecialchars($item->customer_name ?: '—') . '</td>'
-                . '<td><code>' . htmlspecialchars($item->bill_ref) . '</code></td>'
+                . '<td>' . self::e($item->created_at) . '</td>'
+                . '<td>' . self::e($item->trans_id) . '</td>'
+                . '<td>' . self::e(self::displayPhone((string) $item->phone)) . '</td>'
+                . '<td>' . self::e($item->customer_name ?: '—') . '</td>'
+                . '<td><code>' . self::e($item->bill_ref) . '</code></td>'
                 . '<td>KES ' . number_format((float) $item->amount, 2) . '</td>'
                 . '<td>'
-                . '<form method="post" style="display:flex;gap:6px;">'
+                . '<form method="post" style="display:flex;gap:6px;margin:0;">' . FlexPaySecurity::csrfField()
                 . '<input type="hidden" name="fp_action" value="reconcile">'
                 . '<input type="hidden" name="unmatched_id" value="' . (int) $item->id . '">'
-                . '<input class="fp-input" style="width:90px;" type="number" name="invoice_id" placeholder="Inv #" value="' . htmlspecialchars($suggestedInvoiceId) . '" required>'
-                . '<button type="submit" class="fp-btn" style="padding:6px 12px;">Apply</button>'
+                . '<input class="fp-input" style="width:90px;" type="number" min="1" name="invoice_id" placeholder="Inv #" value="' . self::e($suggested) . '" required>'
+                . '<button type="submit" class="fp-btn" style="padding:6px 12px;" onclick="return confirm(\'Apply KES ' . number_format((float) $item->amount, 2) . ' to this invoice?\');">Apply</button>'
                 . '</form>'
-                . '</td>'
-                . '</tr>';
+                . '</td><td>'
+                . '<form method="post" style="margin:0;" onsubmit="var r=prompt(\'Why dismiss this payment? (e.g. not a billing payment)\');if(r===null)return false;this.dismiss_reason.value=r;return true;">' . FlexPaySecurity::csrfField()
+                . '<input type="hidden" name="fp_action" value="dismiss_unmatched">'
+                . '<input type="hidden" name="unmatched_id" value="' . (int) $item->id . '">'
+                . '<input type="hidden" name="dismiss_reason" value="">'
+                . '<button type="submit" class="fp-btn fp-btn-outline" style="padding:6px 10px;">Dismiss</button>'
+                . '</form>'
+                . '</td></tr>';
 
             if ($hint) {
-                $html .= '<tr><td></td><td colspan="6" style="font-size:11px;color:#856404;background:#fffbf0;padding:6px 10px;">&#128161; ' . htmlspecialchars($hint) . '</td></tr>';
+                $html .= '<tr><td></td><td colspan="7" style="font-size:11px;color:#856404;background:#fffbf0;padding:6px 10px;">&#128161; ' . self::e($hint) . '</td></tr>';
             }
         }
 
-        $html .= '</tbody></table>';
-
-        return $html;
+        return $html . '</tbody></table>';
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -495,37 +539,35 @@ class FlexPayViews
 
     public static function renderBalance(string $modulelink): string
     {
-        $gw = FlexPayStore::getFlexPayGatewayParams();
-        $shortcode = $gw['businessShortcode'] ?? '';
+        $gw        = FlexPayStore::getFlexPayGatewayParams();
+        $shortcode = DarajaClient::c2bShortcode($gw);
+        $history   = FlexPayStore::getBalanceHistory($shortcode, 30);
+        $latest    = $history[0] ?? null;
 
-        $history = FlexPayStore::getBalanceHistory($shortcode, 30);
-        $latest  = FlexPayStore::getLatestBalance($shortcode);
-
-        $html = '<form method="post" style="margin-bottom:20px;">';
-        $html .= '<input type="hidden" name="fp_action" value="trigger_balance">';
-        $html .= '<button type="submit" class="fp-btn">&#128260; Request Fresh Balance from Daraja</button>';
-        $html .= ' <span style="font-size:12px;color:#999;margin-left:8px;">Requires B2C Initiator credentials configured in the gateway. Result arrives asynchronously — refresh this page after a few seconds.</span>';
-        $html .= '</form>';
+        $html = '<form method="post" style="margin-bottom:20px;">' . FlexPaySecurity::csrfField()
+            . '<input type="hidden" name="fp_action" value="trigger_balance">'
+            . '<button type="submit" class="fp-btn">&#128260; Request Fresh Balance from Daraja</button>'
+            . ' <span style="font-size:12px;color:#999;margin-left:8px;">Shortcode ' . self::e($shortcode ?: '(not set)') . '. Requires initiator credentials. The result arrives asynchronously — refresh after a few seconds.</span>'
+            . '</form>';
 
         if ($latest) {
-            $html .= '<div class="fp-grid" style="grid-template-columns:repeat(auto-fit, minmax(180px, 1fr));margin-bottom:24px;">';
-            $html .= '<div class="fp-card"><div class="fp-stat-label">Working Account</div><div class="fp-stat-value">KES ' . number_format($latest->working_account, 2) . '</div></div>';
-            $html .= '<div class="fp-card"><div class="fp-stat-label">Utility Account</div><div class="fp-stat-value">KES ' . number_format($latest->utility_account, 2) . '</div></div>';
-            $html .= '<div class="fp-card"><div class="fp-stat-label">Charges Paid Account</div><div class="fp-stat-value">KES ' . number_format($latest->charges_account, 2) . '</div></div>';
-            $html .= '</div>';
-            $html .= '<p style="font-size:12px;color:#999;">Last updated: ' . htmlspecialchars($latest->created_at) . '</p>';
+            $html .= '<div class="fp-grid" style="grid-template-columns:repeat(auto-fit, minmax(180px, 1fr));margin-bottom:24px;">'
+                . '<div class="fp-card"><div class="fp-stat-label">Working Account</div><div class="fp-stat-value">KES ' . number_format((float) $latest->working_account, 2) . '</div></div>'
+                . '<div class="fp-card"><div class="fp-stat-label">Utility Account</div><div class="fp-stat-value">KES ' . number_format((float) $latest->utility_account, 2) . '</div></div>'
+                . '<div class="fp-card"><div class="fp-stat-label">Charges Paid Account</div><div class="fp-stat-value">KES ' . number_format((float) $latest->charges_account, 2) . '</div></div>'
+                . '</div><p style="font-size:12px;color:#999;">Last updated: ' . self::e($latest->created_at) . '</p>';
         } else {
             $html .= '<div class="fp-card" style="color:#888;">No balance data yet — click the button above to request one.</div>';
         }
 
         if (!empty($history)) {
-            $html .= '<h4 style="margin-top:28px;">Balance History</h4>';
-            $html .= '<table class="fp-table"><thead><tr><th>Date</th><th>Working</th><th>Utility</th><th>Charges</th></tr></thead><tbody>';
-            foreach (array_reverse($history) as $h) {
-                $html .= '<tr><td>' . htmlspecialchars($h->created_at) . '</td>'
-                    . '<td>KES ' . number_format($h->working_account, 2) . '</td>'
-                    . '<td>KES ' . number_format($h->utility_account, 2) . '</td>'
-                    . '<td>KES ' . number_format($h->charges_account, 2) . '</td></tr>';
+            $html .= '<h4 style="margin-top:28px;">Balance History</h4>'
+                . '<table class="fp-table"><thead><tr><th>Date</th><th>Working</th><th>Utility</th><th>Charges</th></tr></thead><tbody>';
+            foreach ($history as $h) {
+                $html .= '<tr><td>' . self::e($h->created_at) . '</td>'
+                    . '<td>KES ' . number_format((float) $h->working_account, 2) . '</td>'
+                    . '<td>KES ' . number_format((float) $h->utility_account, 2) . '</td>'
+                    . '<td>KES ' . number_format((float) $h->charges_account, 2) . '</td></tr>';
             }
             $html .= '</tbody></table>';
         }
@@ -534,159 +576,166 @@ class FlexPayViews
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // Tools tab — Transaction Status Query, Reversal, C2B Registration, Simulate
+    // Tools tab
     // ─────────────────────────────────────────────────────────────────────
+
+    private static function toolCard(string $title, string $intro, string $body, string $style = ''): string
+    {
+        return '<div class="fp-card"' . ($style ? ' style="' . $style . '"' : '') . '>'
+            . '<h4 style="margin:0 0 10px;">' . $title . '</h4>'
+            . ($intro !== '' ? '<p style="font-size:12px;color:#777;margin:0 0 12px;">' . $intro . '</p>' : '')
+            . $body . '</div>';
+    }
+
+    private static function actionForm(string $action, string $fields, string $button, string $buttonClass = 'fp-btn', string $confirm = ''): string
+    {
+        return '<form method="post">' . FlexPaySecurity::csrfField()
+            . '<input type="hidden" name="fp_action" value="' . self::e($action) . '">'
+            . $fields
+            . '<button type="submit" class="' . $buttonClass . '"' . ($confirm !== '' ? ' onclick="return confirm(\'' . self::e($confirm) . '\');"' : '') . '>' . $button . '</button>'
+            . '</form>';
+    }
+
+    private static function field(string $type, string $name, string $placeholder, bool $required = true): string
+    {
+        return '<input class="fp-input" style="width:100%;margin-bottom:8px;box-sizing:border-box;" type="' . $type . '" name="' . $name . '" placeholder="' . self::e($placeholder) . '"'
+            . ($type === 'number' ? ' min="1"' : '') . ($required ? ' required' : '') . '>';
+    }
 
     public static function renderTools(string $modulelink): string
     {
-        $gw = FlexPayStore::getFlexPayGatewayParams();
+        $gw        = FlexPayStore::getFlexPayGatewayParams();
         $isSandbox = (($gw['testMode'] ?? '') === 'on');
-        $lastReg = FlexPayStore::getSetting('c2b_registration_last_success', 'never');
+        $lastReg   = (string) FlexPayStore::getSetting('c2b_registration_last_success', '');
+        $regNote   = (string) FlexPayStore::getSetting('c2b_registration_note', '');
+        $license   = FlexPayLicense::check($gw);
 
         $html = '<div class="fp-grid" style="grid-template-columns:repeat(auto-fit, minmax(320px, 1fr));">';
 
-        // License status — first, since it's the thing that determines
-        // whether everything else here even works.
-        $license = FlexPayLicense::check($gw);
-        $statusBadgeClass = $license['valid'] ? 'fp-badge-success' : 'fp-badge-failed';
-        $html .= '<div class="fp-card">';
-        $html .= '<h4 style="margin:0 0 10px;">FlexPay License</h4>';
-        $html .= '<p style="font-size:13px;margin:0 0 10px;">Status: <span class="fp-badge ' . $statusBadgeClass . '">' . htmlspecialchars($license['status']) . '</span></p>';
-        $html .= '<p style="font-size:12px;color:#666;margin:0 0 12px;">' . htmlspecialchars($license['message']) . '</p>';
-        $html .= '<form method="post">';
-        $html .= '<input type="hidden" name="fp_action" value="recheck_license">';
-        $html .= '<button type="submit" class="fp-btn fp-btn-outline">Re-check License Now</button>';
-        $html .= '</form></div>';
+        $html .= self::toolCard(
+            'FlexPay License',
+            '',
+            '<p style="font-size:13px;margin:0 0 10px;">Status: <span class="fp-badge ' . ($license['valid'] ? 'fp-badge-success' : 'fp-badge-failed') . '">' . self::e($license['status']) . '</span></p>'
+            . '<p style="font-size:12px;color:#666;margin:0 0 12px;">' . self::e($license['message']) . '</p>'
+            . self::actionForm('recheck_license', '', 'Re-check License Now', 'fp-btn fp-btn-outline')
+        );
 
-        // Verify Payment — the most common real-world need: "I paid but it's not showing"
-        $html .= '<div class="fp-card" style="border-color:#007229;background:#f6fbf7;">';
-        $html .= '<h4 style="margin:0 0 10px;">&#128269; Verify a Payment</h4>';
-        $html .= '<p style="font-size:12px;color:#666;margin:0 0 12px;">A customer says they paid but the invoice hasn\'t updated? Enter their M-Pesa receipt number (e.g. <code>NLJ7RT61SV</code>), the checkout request ID, or the account reference they used. We check our own records first, then ask Safaricom directly if nothing is found locally.</p>';
-        $html .= '<form method="post">';
-        $html .= '<input type="hidden" name="fp_action" value="verify_payment">';
-        $html .= '<input class="fp-input" style="width:100%;margin-bottom:8px;box-sizing:border-box;" type="text" name="verify_reference" placeholder="Receipt, checkout ID, or reference" required>';
-        $html .= '<input class="fp-input" style="width:100%;margin-bottom:8px;box-sizing:border-box;" type="number" name="verify_invoice_id" placeholder="Invoice # (optional — applies payment if found)">';
-        $html .= '<button type="submit" class="fp-btn">Verify Payment</button>';
-        $html .= '</form>';
-        $html .= '<p style="font-size:11px;color:#999;margin:10px 0 0;">Customers also have their own "Already paid? Verify your payment" box directly on the invoice page — most genuine cases resolve themselves there without needing you. This tool is for the cases that don\'t.</p>';
-        $html .= '</div>';
+        $html .= self::toolCard(
+            '&#129658; Test Configuration',
+            'Checks your Daraja credentials, HTTPS System URL, initiator credentials and callback security — without moving any money.',
+            self::actionForm('test_connection', '', 'Run Test', 'fp-btn fp-btn-outline')
+        );
 
-        // Reset a customer's self-verify rate limit, for the rare case
-        // where several genuine retries (typos, etc.) trip the limit.
-        $html .= '<div class="fp-card">';
-        $html .= '<h4 style="margin:0 0 10px;">Reset Customer Verify Limit</h4>';
-        $html .= '<p style="font-size:12px;color:#888;margin:0 0 12px;">The invoice-page "Verify your payment" box is rate-limited to prevent abuse. If a customer reports being blocked after a few genuine retries, reset their limit here.</p>';
-        $html .= '<form method="post">';
-        $html .= '<input type="hidden" name="fp_action" value="reset_verify_limit">';
-        $html .= '<input class="fp-input" style="width:100%;margin-bottom:8px;box-sizing:border-box;" type="number" name="reset_invoice_id" placeholder="Invoice #" required>';
-        $html .= '<button type="submit" class="fp-btn fp-btn-outline">Reset Limit</button>';
-        $html .= '</form></div>';
+        $html .= self::toolCard(
+            '&#128269; Verify a Payment',
+            'Customer says they paid but the invoice didn\'t update? Enter their M-Pesa receipt (e.g. <code>NLJ7RT61SV</code>), the checkout request ID, or the account reference. We check our records first, then ask Safaricom. With an invoice number, a confirmed payment is applied automatically.',
+            self::actionForm('verify_payment', self::field('text', 'verify_reference', 'Receipt, checkout ID, or reference') . self::field('number', 'verify_invoice_id', 'Invoice # (optional — applies payment if found)', false), 'Verify Payment'),
+            'border-color:#007229;background:#f6fbf7;'
+        );
 
-        // Transaction Status
-        $html .= '<div class="fp-card">';
-        $html .= '<h4 style="margin:0 0 10px;">Transaction Status Query</h4>';
-        $html .= '<p style="font-size:12px;color:#888;margin:0 0 12px;">Check the live status of any M-Pesa receipt directly with Safaricom.</p>';
-        $html .= '<form method="post">';
-        $html .= '<input type="hidden" name="fp_action" value="trigger_status">';
-        $html .= '<input class="fp-input" style="width:100%;margin-bottom:8px;box-sizing:border-box;" type="text" name="transaction_id" placeholder="e.g. NLJ7RT61SV" required>';
-        $html .= '<button type="submit" class="fp-btn">Check Status</button>';
-        $html .= '</form></div>';
+        $html .= self::toolCard(
+            '&#9203; Resolve Pending STK Payments',
+            'Asks Safaricom for the final result of every STK push still pending after 2 minutes, and credits or fails it. Also runs automatically on each WHMCS cron run.',
+            self::actionForm('run_sweeper', '', 'Check Pending Now', 'fp-btn fp-btn-outline')
+        );
 
-        // Reversal
-        $html .= '<div class="fp-card">';
-        $html .= '<h4 style="margin:0 0 10px;">Transaction Reversal</h4>';
-        $html .= '<p style="font-size:12px;color:#888;margin:0 0 12px;">Reverse a completed transaction. Use cautiously — this moves real money back to the customer.</p>';
-        $html .= '<form method="post">';
-        $html .= '<input type="hidden" name="fp_action" value="trigger_reversal">';
-        $html .= '<input class="fp-input" style="width:100%;margin-bottom:8px;box-sizing:border-box;" type="text" name="transaction_id" placeholder="Transaction ID, e.g. NLJ7RT61SV" required>';
-        $html .= '<input class="fp-input" style="width:100%;margin-bottom:8px;box-sizing:border-box;" type="number" name="amount" placeholder="Amount (KES)" required>';
-        $html .= '<button type="submit" class="fp-btn fp-btn-danger" onclick="return confirm(\'Reverse this transaction? This cannot be undone.\');">Reverse Transaction</button>';
-        $html .= '</form></div>';
+        $html .= self::toolCard(
+            'Reset Customer Verify Limit',
+            'The invoice-page "Verify your payment" box is rate-limited to prevent abuse. If a genuine customer gets blocked after a few retries, reset their limit here.',
+            self::actionForm('reset_verify_limit', self::field('number', 'reset_invoice_id', 'Invoice #'), 'Reset Limit', 'fp-btn fp-btn-outline')
+        );
 
-        // C2B Registration
-        $html .= '<div class="fp-card">';
-        $html .= '<h4 style="margin:0 0 10px;">C2B URL Registration</h4>';
-        $html .= '<p style="font-size:12px;color:#888;margin:0 0 4px;">C2B URLs auto-register whenever your shortcode or domain changes.</p>';
-        $html .= '<p style="font-size:12px;color:#888;margin:0 0 12px;">Last successful registration: <strong>' . htmlspecialchars($lastReg ?: 'never') . '</strong></p>';
-        $html .= '<form method="post">';
-        $html .= '<input type="hidden" name="fp_action" value="register_c2b">';
-        $html .= '<button type="submit" class="fp-btn fp-btn-outline">Force Re-Register Now</button>';
-        $html .= '</form></div>';
+        $html .= self::toolCard(
+            'Transaction Status Query',
+            'Ask Safaricom for the status of any M-Pesa receipt. A confirmed payment into your shortcode that isn\'t on file yet is added to the Reconciliation queue.',
+            self::actionForm('trigger_status', self::field('text', 'transaction_id', 'e.g. NLJ7RT61SV'), 'Check Status')
+        );
 
-        // C2B Simulate (sandbox only)
-        $html .= '<div class="fp-card">';
-        $html .= '<h4 style="margin:0 0 10px;">Simulate C2B Payment ' . ($isSandbox ? '' : '<span style="font-size:11px;color:#c0392b;">(Sandbox only)</span>') . '</h4>';
-        if ($isSandbox) {
-            $html .= '<p style="font-size:12px;color:#888;margin:0 0 12px;">Test the full C2B reconciliation flow end-to-end without a real phone.</p>';
-            $html .= '<form method="post">';
-            $html .= '<input type="hidden" name="fp_action" value="simulate_c2b">';
-            $html .= '<input class="fp-input" style="width:100%;margin-bottom:8px;box-sizing:border-box;" type="number" name="sim_amount" placeholder="Amount (KES)" required>';
-            $html .= '<input class="fp-input" style="width:100%;margin-bottom:8px;box-sizing:border-box;" type="text" name="sim_phone" placeholder="Phone, e.g. 0712345678" required>';
-            $html .= '<input class="fp-input" style="width:100%;margin-bottom:8px;box-sizing:border-box;" type="text" name="sim_bill_ref" placeholder="Account Ref, e.g. INV-42" required>';
-            $html .= '<button type="submit" class="fp-btn">Simulate Payment</button>';
-            $html .= '</form>';
-        } else {
-            $html .= '<p style="font-size:12px;color:#888;">Switch to Sandbox / Test Mode in the gateway settings to use this tool.</p>';
-        }
-        $html .= '</div>';
+        $html .= self::toolCard(
+            'Transaction Reversal',
+            'Reverse a completed incoming payment. This moves real money back to the customer and cannot be undone. Record the matching refund on the invoice in WHMCS afterwards.',
+            self::actionForm('trigger_reversal', self::field('text', 'transaction_id', 'Transaction ID, e.g. NLJ7RT61SV') . self::field('number', 'amount', 'Amount (KES)'), 'Reverse Transaction', 'fp-btn fp-btn-danger', 'Reverse this transaction? This cannot be undone.')
+        );
 
-        $html .= '</div>';
+        $systemUrl = FlexPayStore::systemUrl($gw);
+        $html .= self::toolCard(
+            'C2B URL Registration',
+            'C2B URLs auto-register whenever your shortcode or domain changes. Each URL carries a secret key so FlexPay can tell Safaricom\'s notifications from forgeries.',
+            '<p style="font-size:12px;color:#777;margin:0 0 8px;">Last successful registration: <strong>' . self::e($lastReg !== '' ? $lastReg : 'never') . '</strong></p>'
+            . '<p style="font-size:11px;color:#999;margin:0 0 12px;word-break:break-all;">Confirmation URL: <code>' . self::e(preg_replace('/k=[a-f0-9]+/', 'k=••••', FlexPaySecurity::callbackUrl($systemUrl, 'c2b_receipt'))) . '</code></p>'
+            . ($regNote !== '' ? '<p style="font-size:12px;color:#856404;background:#fff3cd;padding:8px;border-radius:5px;">' . self::e($regNote) . '</p>' : '')
+            . self::actionForm('register_c2b', '', 'Force Re-Register Now', 'fp-btn fp-btn-outline')
+        );
 
-        return $html;
+        $html .= self::toolCard(
+            'Simulate C2B Payment' . ($isSandbox ? '' : ' <span style="font-size:11px;color:#c0392b;">(Sandbox only)</span>'),
+            $isSandbox ? 'Test the full C2B reconciliation flow end-to-end without a real phone.' : '',
+            $isSandbox
+                ? self::actionForm('simulate_c2b', self::field('number', 'sim_amount', 'Amount (KES)') . self::field('text', 'sim_phone', 'Phone, e.g. 0708374149') . self::field('text', 'sim_bill_ref', 'Account Ref, e.g. INV-42', false), 'Simulate Payment')
+                : '<p style="font-size:12px;color:#888;">Switch to Sandbox / Test Mode in the gateway settings to use this tool.</p>'
+        );
+
+        return $html . '</div>';
     }
 
     // ─────────────────────────────────────────────────────────────────────
     // API Log tab
     // ─────────────────────────────────────────────────────────────────────
 
-    public static function renderApiLog(string $modulelink): string
+    public static function renderApiLog(string $modulelink, array $get = []): string
     {
-        $logs = FlexPayStore::listApiLog(100);
+        $operation  = preg_replace('/[^a-z0-9_]/', '', (string) ($get['op'] ?? ''));
+        $failedOnly = !empty($get['failed']);
+        $logs       = FlexPayStore::listApiLog(200, $operation !== '' ? $operation : null, $failedOnly ? false : null);
 
-        $html = '<p style="color:#888;font-size:13px;margin-bottom:14px;">Full audit trail of every Daraja API call made by this module — both automated (STK Push, C2B auto-registration) and manually triggered from the Tools tab.</p>';
+        $html = '<p style="color:#888;font-size:13px;margin-bottom:14px;">Audit trail of every Daraja API call and security event — automated (STK, C2B registration, callbacks, cron) and manual (Tools tab). Secrets are never logged.</p>';
 
-        $html .= '<table class="fp-table"><thead><tr>'
-            . '<th>Date</th><th>Operation</th><th>Triggered By</th><th>Result</th><th>Details</th></tr></thead><tbody>';
+        $html .= '<form method="get" action="addonmodules.php" style="margin-bottom:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">'
+            . '<input type="hidden" name="module" value="flexpay_dashboard"><input type="hidden" name="fp_tab" value="apilog">'
+            . '<select class="fp-input" name="op"><option value="">All operations</option>';
+        foreach (FlexPayStore::listApiLogOperations() as $op) {
+            $html .= '<option value="' . self::e($op) . '"' . ($op === $operation ? ' selected' : '') . '>' . self::e($op) . '</option>';
+        }
+        $html .= '</select><label style="font-size:13px;"><input type="checkbox" name="failed" value="1"' . ($failedOnly ? ' checked' : '') . '> Failures only</label>'
+            . '<button type="submit" class="fp-btn">Filter</button></form>';
+
+        $html .= '<table class="fp-table"><thead><tr><th>Date</th><th>Operation</th><th>Triggered By</th><th>Result</th><th>Details</th></tr></thead><tbody>';
 
         if (empty($logs)) {
             $html .= '<tr><td colspan="5" style="text-align:center;color:#999;padding:24px;">No API calls logged yet.</td></tr>';
         }
 
         foreach ($logs as $log) {
-            $badge = $log->success
-                ? '<span class="fp-badge fp-badge-success">OK</span>'
-                : '<span class="fp-badge fp-badge-failed">FAILED</span>';
-
-            $shortResponse = self::truncate((string) $log->response_data, 120);
-
             $html .= '<tr>'
-                . '<td>' . htmlspecialchars($log->created_at) . '</td>'
-                . '<td>' . htmlspecialchars($log->operation) . '</td>'
-                . '<td>' . htmlspecialchars($log->triggered_by) . '</td>'
-                . '<td>' . $badge . '</td>'
-                . '<td style="font-size:11px;color:#888;max-width:380px;overflow:hidden;text-overflow:ellipsis;">' . htmlspecialchars($shortResponse) . '</td>'
+                . '<td style="white-space:nowrap;">' . self::e($log->created_at) . '</td>'
+                . '<td>' . self::e($log->operation) . '</td>'
+                . '<td>' . self::e($log->triggered_by) . '</td>'
+                . '<td>' . ($log->success ? '<span class="fp-badge fp-badge-success">OK</span>' : '<span class="fp-badge fp-badge-failed">FAILED</span>') . '</td>'
+                . '<td style="font-size:11px;color:#888;max-width:480px;">'
+                . '<details><summary style="cursor:pointer;">' . self::e(self::truncate((string) $log->response_data, 120)) . '</summary>'
+                . '<div style="margin-top:6px;"><strong>Request:</strong><pre style="white-space:pre-wrap;word-break:break-all;font-size:11px;">' . self::e(self::truncate((string) $log->request_data, 4000)) . '</pre>'
+                . '<strong>Response:</strong><pre style="white-space:pre-wrap;word-break:break-all;font-size:11px;">' . self::e(self::truncate((string) $log->response_data, 4000)) . '</pre></div>'
+                . '</details></td>'
                 . '</tr>';
         }
 
-        $html .= '</tbody></table>';
-
-        return $html;
+        return $html . '</tbody></table>';
     }
 
-    /**
-     * Truncate a string to a maximum byte length with an ellipsis, without
-     * depending on the mbstring extension (not guaranteed present on every
-     * PHP build, even though WHMCS itself recommends it).
-     *
-     * @param  string $str
-     * @param  int    $maxLen
-     * @return string
-     */
+    /** Byte-safe truncation without depending on mbstring. */
     private static function truncate(string $str, int $maxLen): string
     {
         if (strlen($str) <= $maxLen) {
             return $str;
         }
-        return substr($str, 0, $maxLen) . '…';
+        // Don't cut a UTF-8 sequence in half.
+        $cut = substr($str, 0, $maxLen);
+        while ($cut !== '' && (ord($cut[strlen($cut) - 1]) & 0xC0) === 0x80) {
+            $cut = substr($cut, 0, -1);
+        }
+        if ($cut !== '' && ord($cut[strlen($cut) - 1]) >= 0xC0) {
+            $cut = substr($cut, 0, -1);
+        }
+        return $cut . '…';
     }
 }

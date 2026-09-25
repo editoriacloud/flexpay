@@ -45,7 +45,7 @@
  *
  * @package   FlexPay\Licensing
  * @author    Editoria Cloud Systems <https://www.editoriaweb.co.ke>
- * @version   1.1.0
+ * @version   1.2.0
  */
 
 if (!defined('WHMCS')) {
@@ -81,10 +81,12 @@ class FlexPayLicense
      * call sites (e.g. rendering a friendly error to the customer) need
      * to handle the failure gracefully rather than via a hard die().
      *
-     * @param  array $gw  Gateway params (licenseKey, licensingSecret)
+     * @param  array $gw           Gateway params (licenseKey, licensingSecret)
+     * @param  bool  $allowRemote  false = local cache only, never a network call
+     *                             (used by Daraja callbacks, which must answer fast)
      * @return array  ['valid' => bool, 'status' => string, 'message' => string, 'source' => string]
      */
-    public static function check(array $gw): array
+    public static function check(array $gw, bool $allowRemote = true): array
     {
         if (self::$cachedResult !== null) {
             return self::$cachedResult;
@@ -106,7 +108,7 @@ class FlexPayLicense
         $localKeyDays      = 3;  // remote re-check frequency
         $allowCheckFailDays = 5; // grace period if the licensing server is unreachable
 
-        $domain  = $_SERVER['SERVER_NAME'] ?? php_uname('n');
+        $domain  = self::currentDomain($gw);
         $usersIp = $_SERVER['SERVER_ADDR'] ?? ($_SERVER['LOCAL_ADDR'] ?? '');
         $dirPath = __DIR__;
 
@@ -147,6 +149,19 @@ class FlexPayLicense
                 'status'  => 'Active',
                 'message' => 'License valid (cached).',
                 'source'  => 'local_cache',
+            ];
+        }
+
+        if (!$allowRemote) {
+            // Callers that must not block on the network get the grace-period
+            // answer from the local key, without caching it for the request.
+            $graceOk = $localDecoded !== null && $domainIpOk && ($localDecoded['status'] ?? '') === 'Active'
+                && (string) ($localDecoded['checkdate'] ?? '') > date('Ymd', strtotime('-' . ($localKeyDays + $allowCheckFailDays) . ' days'));
+            return [
+                'valid'   => $graceOk,
+                'status'  => $graceOk ? 'Active' : 'Unverified',
+                'message' => $graceOk ? 'License valid (cached).' : 'License not verified recently (no remote check performed here).',
+                'source'  => 'local_only',
             ];
         }
 
@@ -217,6 +232,29 @@ class FlexPayLicense
     }
 
     /**
+     * The domain this install runs on. Prefers the web server's name; in
+     * CLI/cron (no SERVER_NAME) uses the WHMCS System URL host rather than
+     * the machine hostname, which never matches the licensed domain.
+     */
+    private static function currentDomain(array $gw): string
+    {
+        $name = (string) ($_SERVER['SERVER_NAME'] ?? '');
+        if ($name !== '') {
+            return $name;
+        }
+        $url  = (string) ($gw['systemurl'] ?? '');
+        if ($url === '' && class_exists('App')) {
+            try {
+                $url = (string) \App::getSystemURL();
+            } catch (\Throwable $e) {
+                $url = '';
+            }
+        }
+        $host = (string) parse_url($url, PHP_URL_HOST);
+        return $host !== '' ? $host : php_uname('n');
+    }
+
+    /**
      * Convenience wrapper for payment-processing entry points: returns
      * true/false and never throws, so a license failure degrades into a
      * clear, customer-safe message rather than a fatal error mid-payment.
@@ -263,7 +301,7 @@ class FlexPayLicense
         string $usersIp,
         string $dirPath
     ): ?array {
-        $checkToken = time() . md5(mt_rand(1000000000, 9999999999) . $licenseKey);
+        $checkToken = time() . bin2hex(random_bytes(16));
 
         $postFields = [
             'licensekey'  => $licenseKey,
@@ -291,14 +329,15 @@ class FlexPayLicense
         // licensing server signs its response with
         // md5(secretKey . check_token), which only the real server (which
         // knows the secret) and we (who sent the token) can compute.
-        if (!empty($results['md5hash'])) {
-            $expected = md5($licensingSecret . $checkToken);
-            if (!hash_equals($expected, (string) $results['md5hash'])) {
-                return [
-                    'status'      => 'Invalid',
-                    'description' => 'License server response failed integrity verification.',
-                ];
-            }
+        // The hash is REQUIRED: v3.4 skipped the check when it was absent,
+        // so a spoofed response (DNS/hosts-file redirect) that simply
+        // omitted md5hash was trusted.
+        $expected = md5($licensingSecret . $checkToken);
+        if (empty($results['md5hash']) || !hash_equals($expected, (string) $results['md5hash'])) {
+            return [
+                'status'      => 'Invalid',
+                'description' => 'License server response failed integrity verification.',
+            ];
         }
 
         if (($results['status'] ?? '') === 'Active') {
@@ -324,7 +363,9 @@ class FlexPayLicense
             CURLOPT_CONNECTTIMEOUT => 10,
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_SSL_VERIFYHOST => 2,
-            CURLOPT_USERAGENT      => 'FlexPay-License-Client/1.0',
+            CURLOPT_USERAGENT      => 'FlexPay-License-Client/1.1',
+            CURLOPT_PROTOCOLS      => CURLPROTO_HTTPS,
+            CURLOPT_FOLLOWLOCATION => false,
         ]);
 
         $response = curl_exec($ch);

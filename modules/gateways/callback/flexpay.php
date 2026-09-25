@@ -3,9 +3,8 @@
  * FlexPay Daraja Callback Handler
  *
  * Receives every asynchronous notification Safaricom sends, routed by the
- * ?route= query parameter. None of these routes contain the word "mpesa"
- * anywhere in the path or parameter values, per the no-mpesa-in-URL
- * requirement:
+ * ?route= query parameter (no route contains the word "mpesa", which Daraja
+ * rejects in C2B URLs):
  *
  *   ?route=stk_result            — STK Push payment result
  *   ?route=c2b_check             — C2B validation (pre-payment accept/reject)
@@ -19,9 +18,14 @@
  *   ?route=status_result         — Transaction status query result
  *   ?route=status_timeout        — Status query timeout
  *
- * IMPORTANT:
+ * SECURITY: every route is authenticated (FlexPaySecurity::verifyCallback —
+ * a secret per-route key in the URL, and/or Safaricom's source IPs). In
+ * v3.4 anyone could POST a fake "payment succeeded" here and have an
+ * invoice marked paid. Successful STK results are additionally confirmed
+ * with Daraja's STK Query API before any money is applied, and the amount
+ * applied is always the amount FlexPay itself requested.
+ *
  *  • URL must be publicly reachable over HTTPS (Daraja rejects HTTP).
- *  • Always return HTTP 200 with {"ResultCode":0,...} — Safaricom retries on non-200.
  *  • Do NOT output anything before <?php (no BOM, no whitespace).
  *
  * @see https://developers.whmcs.com/payment-gateways/callbacks/
@@ -32,613 +36,484 @@ require_once __DIR__ . '/../../../init.php';
 require_once __DIR__ . '/../../../includes/gatewayfunctions.php';
 require_once __DIR__ . '/../../../includes/invoicefunctions.php';
 
+require_once __DIR__ . '/../flexpay/FlexPaySecurity.php';
 require_once __DIR__ . '/../flexpay/DarajaClient.php';
 require_once __DIR__ . '/../flexpay/FlexPayStore.php';
 require_once __DIR__ . '/../flexpay/FlexPayLicense.php';
+require_once __DIR__ . '/../flexpay/FlexPayService.php';
 
-$gatewayModuleName = 'flexpay';
-$gatewayParams      = getGatewayVariables($gatewayModuleName);
+use WHMCS\Database\Capsule;
 
-if (!$gatewayParams['type']) {
-    die('Module Not Activated');
+const FLEXPAY_CB_ROUTES = [
+    'stk_result', 'c2b_check', 'c2b_receipt',
+    'disbursement_result', 'disbursement_timeout',
+    'reversal_result', 'reversal_timeout',
+    'balance_result', 'balance_timeout',
+    'status_result', 'status_timeout',
+];
+
+FlexPaySecurity::jsonHeaders();
+
+$gatewayParams = getGatewayVariables('flexpay');
+if (empty($gatewayParams['type'])) {
+    http_response_code(503);
+    echo json_encode(['ResultCode' => 1, 'ResultDesc' => 'Module not activated']);
+    exit;
 }
 
-// Deliberately NOT a hard block here: by the time a callback arrives,
-// Safaricom has already told the customer their payment succeeded — if
-// the license lapsed between the STK prompt being sent and the callback
-// landing, refusing to apply that payment would leave a paying customer
-// stuck with money gone and no credited invoice, which is a worse
-// outcome than letting an already-initiated payment complete. New
-// payment INITIATION is blocked instead, at checkout.php and
-// flexpay_link() — this just logs clearly so the admin sees it.
-$license = FlexPayLicense::check($gatewayParams);
-if (!$license['valid']) {
-    FlexPayStore::logApiCall('license_warning_callback', ['route' => $_GET['route'] ?? ''], $license, false, 'system');
+if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
+    http_response_code(405);
+    echo json_encode(['ResultCode' => 1, 'ResultDesc' => 'Method not allowed']);
+    exit;
 }
 
-$rawInput = (string) file_get_contents('php://input');
-$payload  = json_decode($rawInput, true) ?? [];
-$route    = strtolower(trim($_GET['route'] ?? 'stk_result'));
+$route = strtolower(preg_replace('/[^a-z0-9_]/i', '', (string) ($_GET['route'] ?? '')));
+if (!in_array($route, FLEXPAY_CB_ROUTES, true)) {
+    http_response_code(404);
+    echo json_encode(['ResultCode' => 1, 'ResultDesc' => 'Unknown route']);
+    exit;
+}
 
-header('Content-Type: application/json');
+// Daraja payloads are a few KB; refuse anything absurd before parsing it.
+$rawInput = (string) file_get_contents('php://input', false, null, 0, 65536);
+$payload  = json_decode($rawInput, true);
+if (!is_array($payload)) {
+    http_response_code(400);
+    echo json_encode(['ResultCode' => 1, 'ResultDesc' => 'Invalid JSON']);
+    exit;
+}
+
+$auth = FlexPaySecurity::verifyCallback($route, $gatewayParams);
+
+if (!$auth['ok']) {
+    if ($route === 'c2b_check') {
+        // Validation has no side effects; never block a real customer's
+        // payment because of an unexpected source IP.
+        echo json_encode(['ResultCode' => '0', 'ResultDesc' => 'Accepted']);
+        exit;
+    }
+    // Throttle logging so a flood of forged requests can't bloat the log.
+    if (FlexPaySecurity::rateLimit('cb_reject_log_' . $auth['ip'], 5, 3600)) {
+        FlexPayStore::logApiCall('callback_rejected', ['route' => $route, 'ip' => $auth['ip']], ['payload_bytes' => strlen($rawInput)], false, 'security');
+        if (function_exists('logActivity')) {
+            logActivity('FlexPay: rejected unauthenticated callback to route "' . $route . '" from ' . $auth['ip']);
+        }
+    }
+    http_response_code(403);
+    echo json_encode(['ResultCode' => 1, 'ResultDesc' => 'Rejected']);
+    exit;
+}
+
+if ($auth['via'] === 'disabled' && time() - (int) FlexPayStore::getSetting('callback_insecure_logged', 0) > 3600) {
+    FlexPayStore::setSetting('callback_insecure_logged', (string) time());
+    FlexPayStore::logApiCall('callback_security_off', ['route' => $route, 'ip' => $auth['ip']], [], false, 'security');
+}
+
+// Deliberately NOT a hard block: by the time a callback arrives Safaricom
+// has already taken the customer's money; refusing to record it would hurt
+// the paying customer. New payments are blocked at checkout instead. Local
+// cache only — a slow licensing server must never delay Daraja callbacks.
+$license = FlexPayLicense::check($gatewayParams, false);
+if (!$license['valid'] && time() - (int) FlexPayStore::getSetting('license_callback_logged', 0) > 3600) {
+    FlexPayStore::setSetting('license_callback_logged', (string) time());
+    FlexPayStore::logApiCall('license_warning_callback', ['route' => $route], $license, false, 'system');
+}
 
 switch ($route) {
-
     case 'stk_result':
-        flexpay_cb_stk_result($payload, $gatewayParams, $gatewayModuleName);
+        flexpay_cb_stk_result($payload, $gatewayParams, $auth);
         break;
-
     case 'c2b_check':
         flexpay_cb_c2b_check($payload, $gatewayParams);
         break;
-
     case 'c2b_receipt':
-        flexpay_cb_c2b_receipt($payload, $gatewayParams, $gatewayModuleName);
+        flexpay_cb_c2b_receipt($payload, $gatewayParams);
         break;
-
     case 'disbursement_result':
         flexpay_cb_disbursement_result($payload, $gatewayParams);
         break;
-
     case 'disbursement_timeout':
-        flexpay_cb_generic_timeout($payload, 'Disbursement (B2C) Queue Timeout');
+        flexpay_cb_disbursement_timeout($payload, $gatewayParams);
         break;
-
     case 'reversal_result':
-        flexpay_cb_reversal_result($payload, $gatewayParams);
-        break;
-
     case 'reversal_timeout':
-        flexpay_cb_generic_timeout($payload, 'Reversal Queue Timeout');
+        flexpay_cb_reversal_result($payload, $gatewayParams, $route === 'reversal_timeout');
         break;
-
     case 'balance_result':
         flexpay_cb_balance_result($payload, $gatewayParams);
         break;
-
-    case 'balance_timeout':
-        flexpay_cb_generic_timeout($payload, 'Balance Query Timeout');
-        break;
-
     case 'status_result':
         flexpay_cb_status_result($payload, $gatewayParams);
         break;
-
-    case 'status_timeout':
-        flexpay_cb_generic_timeout($payload, 'Transaction Status Query Timeout');
-        break;
-
-    default:
-        flexpay_json_ok();
+    default: // *_timeout
+        flexpay_cb_generic_timeout($payload, $gatewayParams, ucfirst(str_replace('_', ' ', $route)));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // STK Push result
 // ═══════════════════════════════════════════════════════════════════════════════
-function flexpay_cb_stk_result(array $payload, array $gw, string $moduleName): void
+function flexpay_cb_stk_result(array $payload, array $gw, array $auth): void
 {
     $stk        = $payload['Body']['stkCallback'] ?? [];
-    $resultCode = isset($stk['ResultCode']) ? (int) $stk['ResultCode'] : -1;
-    $resultDesc = $stk['ResultDesc'] ?? 'No description';
-    $checkoutId = $stk['CheckoutRequestID'] ?? '';
-    $merchantId = $stk['MerchantRequestID'] ?? '';
+    $resultCode = isset($stk['ResultCode']) ? (string) $stk['ResultCode'] : '';
+    $resultDesc = (string) ($stk['ResultDesc'] ?? '');
+    $checkoutId = preg_replace('/[^A-Za-z0-9_\-]/', '', (string) ($stk['CheckoutRequestID'] ?? ''));
 
-    if (empty($checkoutId)) {
+    if ($checkoutId === '') {
         logTransaction($gw['name'], $payload, 'STK Callback – Missing CheckoutRequestID');
         flexpay_json_ok();
         return;
     }
 
-    $meta = [];
-    foreach (($stk['CallbackMetadata']['Item'] ?? []) as $item) {
-        if (isset($item['Name'])) {
-            $meta[$item['Name']] = $item['Value'] ?? null;
-        }
-    }
-
-    $receipt = (string) ($meta['MpesaReceiptNumber'] ?? '');
-    $amount  = isset($meta['Amount']) ? (float) $meta['Amount'] : 0.0;
+    $meta = flexpay_cb_items($stk['CallbackMetadata']['Item'] ?? [], 'Name', 'Value');
+    $receipt = strtoupper((string) ($meta['MpesaReceiptNumber'] ?? ''));
+    $amount  = isset($meta['Amount']) ? (float) $meta['Amount'] : null;
     $phone   = (string) ($meta['PhoneNumber'] ?? '');
 
-    if ($resultCode === 0 && $receipt !== '') {
-        $settlement = FlexPayStore::settleStkSuccess($checkoutId, $receipt, $amount, $phone, $resultDesc, $moduleName, 'callback');
-        logTransaction($gw['name'], $stk, 'STK Success – Receipt: ' . $receipt . ' — ' . $settlement['message']);
+    if ($receipt !== '' && !preg_match('/^[A-Z0-9]{6,20}$/', $receipt)) {
+        $receipt = '';
+    }
 
+    if ($resultCode === '0') {
+        // Independently confirm with Daraja before touching money.
+        if (($gw['verifyStkCallbacks'] ?? 'on') === 'on') {
+            [$confirmedCode, $queryResponse] = FlexPayService::fetchStkResultCode($gw, $checkoutId);
+
+            if ($confirmedCode !== '' && $confirmedCode !== '0') {
+                FlexPayStore::logApiCall('stk_callback_contradicted', ['checkout_request_id' => $checkoutId, 'callback_receipt' => $receipt, 'ip' => $auth['ip']], $queryResponse, false, 'security');
+                FlexPayStore::markStkFailed($checkoutId, $confirmedCode, DarajaClient::describeResultCode($confirmedCode));
+                logTransaction($gw['name'], $stk, 'STK Callback REJECTED – Daraja reports code ' . $confirmedCode . ' for this request');
+                flexpay_json_ok();
+                return;
+            }
+
+            if ($confirmedCode === '' && $auth['via'] !== 'token') {
+                // Couldn't confirm and the request isn't key-authenticated:
+                // leave it pending; the invoice poller / cron sweeper will
+                // settle it from Daraja's own answer.
+                FlexPayStore::logApiCall('stk_callback_unconfirmed', ['checkout_request_id' => $checkoutId, 'via' => $auth['via']], $queryResponse, false, 'callback');
+                logTransaction($gw['name'], $stk, 'STK Success reported – awaiting confirmation from Daraja');
+                flexpay_json_ok();
+                return;
+            }
+        }
+
+        $settlement = FlexPayStore::settleStk($checkoutId, $receipt ?: null, 'callback', $phone, $amount);
+        logTransaction($gw['name'], $stk, 'STK Success – Receipt: ' . ($receipt ?: '(none)') . ' — ' . $settlement['message']);
     } else {
-        $invoiceId = flexpay_lookup_pending_invoice($checkoutId);
+        $desc = $resultCode !== '' ? DarajaClient::describeResultCode($resultCode) : ($resultDesc ?: 'Payment failed');
+        FlexPayStore::markStkFailed($checkoutId, $resultCode, $desc, json_encode($stk));
         logTransaction($gw['name'], $stk, 'STK Failed – Code ' . $resultCode . ': ' . $resultDesc);
-
-        FlexPayStore::recordTransaction([
-            'channel'             => 'stk',
-            'direction'           => 'in',
-            'invoice_id'          => $invoiceId,
-            'checkout_request_id' => $checkoutId,
-            'merchant_request_id' => $merchantId,
-            'status'              => 'failed',
-            'result_code'         => (string) $resultCode,
-            'result_desc'         => DarajaClient::describeResultCode($resultCode),
-            'raw_response'        => json_encode($stk),
-        ]);
     }
 
     flexpay_json_ok();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// C2B validation — intelligent strict/lenient handling
+// C2B validation — strict/lenient
 // ═══════════════════════════════════════════════════════════════════════════════
 /**
- * Fires before a C2B payment is finalized. This is where "intelligent"
- * automation actually happens:
- *
- *  - lenient mode (default): always accept. Unrecognised references get
- *    reconciled later in the dashboard — never blocks a real payment due
- *    to a typo'd account number.
- *  - strict mode: rejects up-front if the reference doesn't map to an
- *    open, unpaid invoice, telling the customer immediately (M-Pesa shows
- *    the rejection reason on their phone) rather than silently capturing
- *    an unreconciled payment.
- *
- * Either mode tolerates common reference typos by trying multiple parse
- * strategies (see flexpay_parse_invoice_ref) before giving up.
+ * Fires before a C2B payment completes (only if Safaricom has enabled
+ * external validation on the shortcode).
+ *   lenient (default): always accept; unknown references are reconciled later.
+ *   strict: reject paybill payments whose account number doesn't resolve to
+ *           an open invoice — the customer sees the rejection on their phone.
+ *           Payments with no reference (Till) are always accepted.
  */
 function flexpay_cb_c2b_check(array $payload, array $gw): void
 {
-    $billRef = (string) ($payload['BillRefNumber'] ?? '');
-    $amount  = (float) ($payload['TransAmount'] ?? 0);
+    $billRef = trim((string) ($payload['BillRefNumber'] ?? ''));
     $mode    = $gw['c2bValidationMode'] ?? 'lenient';
 
-    logTransaction($gw['name'], $payload, 'C2B Validate (' . $mode . ') – Ref: ' . ($billRef ?: '(none)'));
-
-    if ($mode !== 'strict') {
+    if ($mode !== 'strict' || $billRef === '' || preg_match('/^0+$/', $billRef)) {
         echo json_encode(['ResultCode' => '0', 'ResultDesc' => 'Accepted']);
         return;
     }
 
-    $billRefLooksUsable = (trim($billRef) !== '') && !preg_match('/^0+$/', trim($billRef));
-
-    // Till (Buy Goods) payments never carry a usable BillRefNumber by
-    // design — Safaricom doesn't ask the customer for one. Rejecting
-    // every till payment outright in strict mode would block 100% of
-    // legitimate Till transactions, so instead we check whether the
-    // amount unambiguously matches exactly one open invoice. If it does,
-    // accept now and let the confirmation step apply it via the same
-    // amount-matching logic. If it's ambiguous or doesn't match anything,
-    // we still accept (since rejecting loses the payment for everyone,
-    // whereas accepting-then-queueing-for-reconciliation loses nothing)
-    // and let the dashboard's Reconciliation tab handle it.
-    if (!$billRefLooksUsable) {
-        echo json_encode(['ResultCode' => '0', 'ResultDesc' => 'Accepted']);
+    if ((float) ($payload['TransAmount'] ?? 0) <= 0) {
+        echo json_encode(['ResultCode' => 'C2B00013', 'ResultDesc' => 'Rejected']);
         return;
     }
 
-    $invoiceId = flexpay_parse_invoice_ref($billRef);
+    $invoiceId = FlexPayStore::parseInvoiceRef($billRef, (string) ($gw['accountRefPrefix'] ?? 'INV'));
+    $invoice   = $invoiceId !== null ? FlexPayStore::getInvoice($invoiceId) : null;
 
-    if ($invoiceId === null) {
-        // Couldn't extract any plausible invoice number at all
-        echo json_encode(['ResultCode' => 'C2B00012', 'ResultDesc' => 'Invalid account number format']);
+    if (!$invoice || !in_array($invoice->status, FlexPayStore::OPEN_INVOICE_STATUSES, true)) {
+        logTransaction($gw['name'], $payload, 'C2B Validation REJECTED (strict) – Ref: ' . $billRef);
+        echo json_encode(['ResultCode' => 'C2B00012', 'ResultDesc' => 'Rejected']);
         return;
-    }
-
-    try {
-        $invoice = \WHMCS\Database\Capsule::table('tblinvoices')
-            ->where('id', $invoiceId)
-            ->whereIn('status', ['Unpaid', 'Overdue'])
-            ->first(['id', 'total']);
-
-        if (!$invoice) {
-            echo json_encode(['ResultCode' => 'C2B00011', 'ResultDesc' => 'Invoice not found or already paid']);
-            return;
-        }
-    } catch (\Exception $e) {
-        // DB error mid-validation — accept to be safe, reconcile in confirm step
     }
 
     echo json_encode(['ResultCode' => '0', 'ResultDesc' => 'Accepted']);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// C2B confirmation — intelligent dual-strategy reconciliation:
-//   - Paybill payments carry a real BillRefNumber → match by invoice
-//     reference (tolerating typos), exactly as before.
-//   - Till (Buy Goods) payments carry NO usable account reference at all
-//     — Safaricom's own C2B payload leaves BillRefNumber empty for these,
-//     since the customer never enters one. For these, we intelligently
-//     match by amount against currently-open invoices, using the
-//     transaction timestamp to prefer the most recently due/created
-//     invoice when more than one open invoice shares the same amount.
-//     If the match isn't unambiguous, we never guess — it goes to the
-//     Reconciliation queue for a human to confirm in one click.
+// C2B confirmation
 // ═══════════════════════════════════════════════════════════════════════════════
-function flexpay_cb_c2b_receipt(array $payload, array $gw, string $moduleName): void
+function flexpay_cb_c2b_receipt(array $payload, array $gw): void
 {
-    $transId   = (string) ($payload['TransID']       ?? '');
-    $amount    = (float)  ($payload['TransAmount']   ?? 0);
-    $billRef   = (string) ($payload['BillRefNumber'] ?? '');
-    $phone     = (string) ($payload['MSISDN']        ?? '');
-    $firstName = (string) ($payload['FirstName']     ?? '');
-    $lastName  = (string) ($payload['LastName']      ?? '');
-    $transTime = (string) ($payload['TransTime']     ?? ''); // YYYYMMDDHHmmss, Safaricom's own timestamp
+    $transId   = strtoupper(trim((string) ($payload['TransID'] ?? '')));
+    $amount    = round((float) ($payload['TransAmount'] ?? 0), 2);
+    $billRef   = substr(trim((string) ($payload['BillRefNumber'] ?? '')), 0, 50);
+    $msisdn    = trim((string) ($payload['MSISDN'] ?? ''));
+    $shortcode = trim((string) ($payload['BusinessShortCode'] ?? ''));
+    $name      = trim(implode(' ', array_filter([
+        (string) ($payload['FirstName'] ?? ''), (string) ($payload['MiddleName'] ?? ''), (string) ($payload['LastName'] ?? ''),
+    ])));
+    $transTime = (string) ($payload['TransTime'] ?? '');
 
-    if (empty($transId)) {
-        logTransaction($gw['name'], $payload, 'C2B Confirm – Missing TransID');
+    if (!preg_match('/^[A-Z0-9]{6,20}$/', $transId) || $amount <= 0) {
+        logTransaction($gw['name'], $payload, 'C2B Confirm – invalid TransID/amount, ignored');
+        flexpay_json_ok();
+        return;
+    }
+
+    // Retried confirmation, or already recorded via the STK callback.
+    if (FlexPayStore::findTransactionByReceipt($transId)) {
         flexpay_json_ok();
         return;
     }
 
     logTransaction($gw['name'], $payload, 'C2B Confirm – TransID: ' . $transId);
 
-    $invoiceId    = null;
-    $matched      = false;
-    $matchMethod  = 'none';
-    $billRefLooksUsable = (trim($billRef) !== '') && !preg_match('/^0+$/', trim($billRef));
-
-    // ── Strategy 1: Paybill-style reference parsing (existing behaviour) ──
-    if ($billRefLooksUsable) {
-        $parsedRef = flexpay_parse_invoice_ref($billRef);
-
-        if ($parsedRef !== null) {
-            try {
-                $invoice = \WHMCS\Database\Capsule::table('tblinvoices')->where('id', $parsedRef)->first(['id', 'status', 'total']);
-                if ($invoice) {
-                    $invoiceId   = $parsedRef;
-                    $matchMethod = 'account_reference';
-                }
-            } catch (\Exception $e) {
-                // fall through to strategy 2
-            }
-        }
+    // Is this the C2B echo of an STK push we started? Then settle THAT push
+    // with the real receipt instead of applying the money a second time.
+    $stkRow = FlexPayStore::findStkForC2B($amount, $billRef, $msisdn);
+    if ($stkRow) {
+        $settlement = FlexPayStore::settleStk((string) $stkRow->checkout_request_id, $transId, 'c2b_confirmation', $msisdn, $amount);
+        logTransaction($gw['name'], $payload, 'C2B Confirm linked to STK ' . $stkRow->checkout_request_id . ' — ' . $settlement['message']);
+        flexpay_json_ok();
+        return;
     }
 
-    // ── Strategy 2: Till-style intelligent amount + timestamp matching ──
-    // Used whenever there's no usable reference at all (the normal case
-    // for Buy Goods/Till payments) OR the reference didn't resolve to a
-    // real invoice. Looks for open invoices whose total matches exactly;
-    // if more than one open invoice shares that exact amount, we
-    // deliberately do NOT guess — ambiguous matches always go to the
-    // Reconciliation queue so a human confirms which one it was, rather
-    // than risking crediting the wrong customer's invoice.
-    if ($invoiceId === null) {
-        $candidate = flexpay_find_invoice_by_amount($amount, $transTime);
+    $ourShortcodes = array_filter([DarajaClient::c2bShortcode($gw), DarajaClient::stkPartyB($gw), (string) ($gw['businessShortcode'] ?? '')]);
+    $shortcodeOk   = $shortcode === '' || in_array($shortcode, $ourShortcodes, true);
 
-        if ($candidate !== null) {
-            $invoiceId   = $candidate;
-            $matchMethod = 'amount_timestamp';
-        }
-    }
-
-    $outcome = null;
-
-    if ($invoiceId !== null) {
-        try {
-            $normalizedInvoiceId = checkCbInvoiceID($invoiceId, $gw['name']);
-            checkCbTransID($transId);
-            addInvoicePayment($normalizedInvoiceId, $transId, $amount, 0, $moduleName);
-            $matched   = true;
-            $invoiceId = $normalizedInvoiceId;
-            $outcome   = FlexPayStore::classifyPaymentOutcome($normalizedInvoiceId, $amount);
-            logTransaction($gw['name'], $payload, "C2B Applied to Invoice #{$invoiceId} (matched via {$matchMethod}) — {$outcome['message']}");
-        } catch (\Exception $e) {
-            // checkCbInvoiceID/checkCbTransID may die() intentionally on
-            // duplicate detection — that's WHMCS's own safe behaviour.
-        }
-    }
-
-    // When nothing matched exactly, check whether this amount could
-    // plausibly be a PARTIAL payment toward one or more open invoices —
-    // purely informational, never auto-applied (see
-    // flexpay_detect_possible_partial's docblock for why). This turns a
-    // bare "no matching invoice found" into actionable context for
-    // whoever reconciles it: "this could be a partial payment toward
-    // Invoice #X (KES Y still owed)" instead of starting from zero.
-    $possiblePartials = [];
-    if (!$matched) {
-        $possiblePartials = flexpay_detect_possible_partial($amount);
-    }
-
-    $partialNote = '';
-    if (!empty($possiblePartials)) {
-        $parts = array_map(
-            fn($p) => "#{$p['id']} (balance KES " . number_format($p['balance'], 2) . ")",
-            array_slice($possiblePartials, 0, 5) // cap the note length if many invoices qualify
-        );
-        $partialNote = ' Possible partial payment toward: ' . implode(', ', $parts) . '.';
-    }
-
-    FlexPayStore::recordTransaction([
+    // Insert first: the UNIQUE receipt index makes concurrent retries of
+    // this same confirmation lose the race instead of double-applying.
+    $rowId = FlexPayStore::insertTransactionOnce([
         'channel'           => 'c2b',
         'direction'         => 'in',
-        'invoice_id'        => $matched ? $invoiceId : null,
         'mpesa_receipt'     => $transId,
-        'phone'             => $phone,
+        'phone'             => $msisdn,
         'amount'            => $amount,
         'account_reference' => $billRef,
         'status'            => 'success',
         'result_code'       => '0',
-        'result_desc'       => $matched
-            ? ($outcome['message'] ?? "Matched and applied (via {$matchMethod})")
-            : ('No matching invoice found — needs manual reconciliation.' . $partialNote),
-        'payment_outcome'   => $matched ? ($outcome['outcome'] ?? null) : (!empty($possiblePartials) ? 'possible_partial' : null),
+        'result_desc'       => 'Received — matching…',
         'raw_response'      => json_encode($payload),
     ]);
-
-    if (!$matched) {
-        FlexPayStore::storeUnmatched([
-            'trans_id'      => $transId,
-            'amount'        => $amount,
-            'phone'         => $phone,
-            'bill_ref'      => $billRef ?: '(none — likely a Till/Buy Goods payment)',
-            'customer_name' => trim($firstName . ' ' . $lastName),
-            'notes'         => $partialNote ? trim($partialNote) : '',
-            'raw_data'      => json_encode($payload),
-        ]);
-        logTransaction($gw['name'], $payload, 'C2B Unmatched – stored for dashboard reconciliation. Ref: ' . ($billRef ?: '(none)') . $partialNote);
+    if ($rowId === null) {
+        flexpay_json_ok();
+        return;
     }
 
+    $match = $shortcodeOk
+        ? FlexPayStore::matchC2BInvoice($amount, $billRef, $msisdn, $transTime, $gw)
+        : ['invoice_id' => null, 'method' => 'none', 'note' => "Paid to shortcode {$shortcode}, which is not configured in FlexPay.", 'suggested' => null];
+
+    $apply = null;
+    if ($match['invoice_id'] !== null) {
+        $apply = FlexPayStore::applyPaymentToInvoice($match['invoice_id'], $transId, $amount, FlexPayStore::OPEN_INVOICE_STATUSES);
+    }
+
+    if ($apply && $apply['applied']) {
+        $invoice = FlexPayStore::getInvoice($match['invoice_id']);
+        FlexPayStore::updateTransaction($rowId, [
+            'invoice_id'      => $match['invoice_id'],
+            'client_id'       => $invoice ? (int) $invoice->userid : null,
+            'payment_outcome' => $apply['outcome']['outcome'] ?? null,
+            'result_desc'     => $apply['message'],
+        ]);
+        logTransaction($gw['name'], $payload, "C2B Applied to Invoice #{$match['invoice_id']} (matched via {$match['method']}) — {$apply['message']}");
+        flexpay_json_ok();
+        return;
+    }
+
+    // Not applied — queue for a human, with as much context as we have.
+    $notes = trim($match['note'] . ($apply ? ' ' . $apply['message'] : ''));
+    $partials = FlexPayStore::detectPossiblePartials($amount, $msisdn);
+    if (!empty($partials)) {
+        $parts = array_map(function ($p) {
+            return '#' . $p['id'] . ' (balance KES ' . number_format($p['balance_kes'], 2) . ($p['phone_match'] ? ', same phone' : '') . ')';
+        }, $partials);
+        $notes = trim($notes . ' Possible partial payment toward: ' . implode(', ', $parts) . '.');
+    }
+
+    $suggested = $match['suggested'] ?? $match['invoice_id'];
+    if ($suggested === null && !empty($partials) && ($partials[0]['phone_match'] || count($partials) === 1)) {
+        $suggested = $partials[0]['id'];
+    }
+
+    FlexPayStore::updateTransaction($rowId, [
+        'result_desc'     => 'No matching invoice found — needs manual reconciliation.',
+        'payment_outcome' => !empty($partials) ? 'possible_partial' : null,
+    ]);
+
+    FlexPayStore::storeUnmatched([
+        'trans_id'             => $transId,
+        'amount'               => $amount,
+        'phone'                => $msisdn,
+        'bill_ref'             => $billRef !== '' ? $billRef : '(none — likely a Till/Buy Goods payment)',
+        'customer_name'        => $name,
+        'notes'                => $notes,
+        'suggested_invoice_id' => $suggested,
+        'raw_data'             => json_encode($payload),
+    ]);
+
+    logTransaction($gw['name'], $payload, 'C2B Unmatched – queued for reconciliation. Ref: ' . ($billRef !== '' ? $billRef : '(none)') . ($notes !== '' ? ' — ' . $notes : ''));
     flexpay_json_ok();
 }
 
-/**
- * Intelligent amount-based invoice matching for Till (Buy Goods) C2B
- * payments, which never carry a usable account reference. Looks for
- * currently-open (Unpaid/Overdue) invoices whose total exactly matches
- * the amount paid.
- *
- * Disambiguation when multiple open invoices share the same total:
- *   - If a transaction timestamp is available, prefer the invoice whose
- *     due date is closest to (on or before) that timestamp — the most
- *     likely candidate a customer would be paying right now.
- *   - If still tied, or no timestamp is available, refuse to guess and
- *     return null so the payment is queued for manual reconciliation
- *     instead of risking a wrong match.
- *
- * Deliberately does NOT attempt partial-payment matching here — matching
- * an amount LESS than an invoice's total has no natural uniqueness
- * signal (KES 400 could plausibly be a partial payment toward any open
- * invoice with a balance of 400 or more), so auto-applying it would risk
- * crediting the wrong customer. See flexpay_detect_possible_partial()
- * for how that case is surfaced instead — flagged for a human, never
- * auto-applied.
- *
- * @param  float  $amount
- * @param  string $transTime  Safaricom TransTime, format YYYYMMDDHHmmss (may be empty)
- * @return int|null
- */
-function flexpay_find_invoice_by_amount(float $amount, string $transTime = ''): ?int
-{
-    if ($amount <= 0) {
-        return null;
-    }
-
-    try {
-        $candidates = \WHMCS\Database\Capsule::table('tblinvoices')
-            ->whereIn('status', ['Unpaid', 'Overdue'])
-            ->where('total', $amount)
-            ->orderBy('duedate', 'asc')
-            ->get(['id', 'duedate', 'date']);
-    } catch (\Exception $e) {
-        return null;
-    }
-
-    $count = is_array($candidates) ? count($candidates) : $candidates->count();
-
-    if ($count === 0) {
-        return null;
-    }
-
-    if ($count === 1) {
-        $first = is_array($candidates) ? $candidates[0] : $candidates->first();
-        return (int) $first->id;
-    }
-
-    // Multiple open invoices share this exact amount — try to disambiguate
-    // using the transaction timestamp, preferring the invoice due on or
-    // closest to the day the payment was made (the customer is most
-    // likely settling the bill that's currently due, not a future one).
-    // Comparison is at day granularity — due dates have no meaningful
-    // time-of-day component, and this avoids spurious "near ties" caused
-    // by time-of-day noise that would otherwise make disambiguation less
-    // deterministic than it should be.
-    if ($transTime !== '' && preg_match('/^\d{14}$/', $transTime)) {
-        $txnDateOnly = \DateTime::createFromFormat('Ymd', substr($transTime, 0, 8));
-
-        if ($txnDateOnly) {
-            $txnDateOnly->setTime(0, 0, 0);
-            $bestDiffDays = null;
-            $tiedAtBest   = [];
-
-            foreach ($candidates as $inv) {
-                if (empty($inv->duedate) || $inv->duedate === '0000-00-00') {
-                    continue;
-                }
-                $due = \DateTime::createFromFormat('Y-m-d', substr($inv->duedate, 0, 10));
-                if (!$due) {
-                    continue;
-                }
-                $due->setTime(0, 0, 0);
-
-                $diffDays = abs($txnDateOnly->diff($due)->days);
-
-                if ($bestDiffDays === null || $diffDays < $bestDiffDays) {
-                    $bestDiffDays = $diffDays;
-                    $tiedAtBest   = [$inv];
-                } elseif ($diffDays === $bestDiffDays) {
-                    $tiedAtBest[] = $inv;
-                }
-            }
-
-            if ($bestDiffDays !== null && count($tiedAtBest) === 1) {
-                return (int) $tiedAtBest[0]->id;
-            }
-
-            // Either a genuine tie at the closest distance, or no invoice
-            // had a usable due date at all — refuse to guess.
-            return null;
-        }
-    }
-
-    // No usable transaction timestamp to disambiguate with, and more than
-    // one invoice matches the amount — refuse to guess.
-    return null;
-}
-
-/**
- * Detect whether an unmatched amount PLAUSIBLY represents a partial
- * payment toward one or more currently-open invoices, purely to give a
- * human reconciler useful context — this NEVER auto-applies anything.
- *
- * Unlike exact-amount matching (flexpay_find_invoice_by_amount), there's
- * no natural uniqueness signal for "this amount is less than the balance
- * of invoice X" — many open invoices could plausibly be the target of a
- * partial payment. Auto-applying here would risk crediting the wrong
- * customer's invoice, which is a real mistake with real consequences, so
- * this function only ever informs, never decides.
- *
- * @param  float $amount
- * @return array  List of ['id' => int, 'total' => float, 'balance' => float]
- *                for open invoices whose balance is greater than the
- *                amount paid (i.e. this payment could plausibly be a
- *                partial payment toward them). Empty array if amount is
- *                zero, or no invoice's balance exceeds it.
- */
-function flexpay_detect_possible_partial(float $amount): array
-{
-    if ($amount <= 0) {
-        return [];
-    }
-
-    try {
-        $candidates = \WHMCS\Database\Capsule::table('tblinvoices')
-            ->whereIn('status', ['Unpaid', 'Overdue'])
-            ->where('balance', '>', $amount)
-            ->orderBy('duedate', 'asc')
-            ->get(['id', 'total', 'balance']);
-    } catch (\Exception $e) {
-        return [];
-    }
-
-    $out = [];
-    foreach ($candidates as $inv) {
-        $out[] = ['id' => (int) $inv->id, 'total' => (float) $inv->total, 'balance' => (float) $inv->balance];
-    }
-
-    return $out;
-}
-
-/**
- * Intelligently extract a WHMCS invoice ID from a customer-entered C2B
- * account reference, tolerating common variations:
- *
- *   "INV-42"   → 42
- *   "INV42"    → 42
- *   "inv 42"   → 42
- *   "42"       → 42
- *   "0000042"  → 42
- *   "INV-42-A" → 42  (extra suffix ignored)
- *   "garbage"  → null
- *
- * @param  string $ref
- * @return int|null
- */
-function flexpay_parse_invoice_ref(string $ref): ?int
-{
-    $ref = trim($ref);
-    if ($ref === '') {
-        return null;
-    }
-
-    // Strategy 1: any run of digits anywhere in the string
-    if (preg_match('/(\d+)/', $ref, $m)) {
-        $num = (int) $m[1];
-        if ($num > 0) {
-            return $num;
-        }
-    }
-
-    return null;
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
-// B2C (disbursement / refund) result
+// B2C (refund) result / timeout
 // ═══════════════════════════════════════════════════════════════════════════════
 function flexpay_cb_disbursement_result(array $payload, array $gw): void
 {
     $result         = $payload['Result'] ?? [];
-    $resultCode     = (int) ($result['ResultCode'] ?? -1);
+    $resultCode     = (string) ($result['ResultCode'] ?? '-1');
     $resultDesc     = (string) ($result['ResultDesc'] ?? '');
-    $transId        = (string) ($result['TransactionID'] ?? '');
+    $transId        = strtoupper((string) ($result['TransactionID'] ?? ''));
     $conversationId = (string) ($result['ConversationID'] ?? '');
+    $originatorId   = (string) ($result['OriginatorConversationID'] ?? '');
 
-    $params = [];
-    foreach (($result['ResultParameters']['ResultParameter'] ?? []) as $p) {
-        if (isset($p['Key'])) {
-            $params[$p['Key']] = $p['Value'] ?? null;
+    $params  = flexpay_cb_items($result['ResultParameters']['ResultParameter'] ?? [], 'Key', 'Value');
+    $amount  = isset($params['TransactionAmount']) ? (float) $params['TransactionAmount'] : 0.0;
+    $receipt = strtoupper((string) ($params['TransactionReceipt'] ?? $transId));
+    $phone   = trim(explode(' - ', (string) ($params['ReceiverPartyPublicName'] ?? ''))[0]);
+
+    $success = $resultCode === '0';
+    $refund  = FlexPayStore::findRefundByIds($conversationId, $originatorId);
+
+    logTransaction($gw['name'], $payload, 'Disbursement ' . ($success ? 'Success' : 'Failed') . ' – ' . $resultDesc);
+
+    FlexPayStore::insertTransactionOnce([
+        'channel'                    => 'b2c',
+        'direction'                  => 'out',
+        'invoice_id'                 => $refund ? (int) $refund->invoice_id : null,
+        'conversation_id'            => $conversationId,
+        'originator_conversation_id' => $originatorId,
+        // Failed B2C results often carry a placeholder TransactionID; never
+        // let it occupy the unique receipt slot.
+        'mpesa_receipt'              => ($success && preg_match('/^[A-Z0-9]{6,20}$/', $receipt)) ? $receipt : null,
+        'phone'                      => $phone !== '' ? $phone : ($refund ? (string) $refund->phone : ''),
+        'amount'                     => $amount > 0 ? $amount : ($refund ? (float) $refund->amount : 0),
+        'status'                     => $success ? 'success' : 'failed',
+        'result_code'                => $resultCode,
+        'result_desc'                => $resultDesc ?: DarajaClient::describeResultCode($resultCode),
+        'raw_response'               => json_encode($result),
+    ]);
+
+    if ($refund) {
+        FlexPayStore::updateRefund((int) $refund->id, [
+            'status'      => $success ? 'success' : 'failed',
+            'result_desc' => $success ? ('Paid — receipt ' . $receipt) : ($resultDesc ?: DarajaClient::describeResultCode($resultCode)),
+        ]);
+        if (!$success && function_exists('logActivity')) {
+            logActivity('FlexPay: M-Pesa refund of KES ' . number_format((float) $refund->amount, 2) . ' for Invoice #' . (int) $refund->invoice_id
+                . ' FAILED (' . $resultDesc . '). WHMCS recorded the refund but no money was sent — retry it from Addons → FlexPay Dashboard → Refunds.');
         }
     }
 
-    $amount  = isset($params['TransactionAmount']) ? (float) $params['TransactionAmount'] : 0.0;
-    $receipt = (string) ($params['TransactionReceipt'] ?? $transId);
-    $phone   = (string) ($params['ReceiverPartyPublicName'] ?? '');
+    flexpay_json_ok();
+}
 
-    $status = ($resultCode === 0) ? 'success' : 'failed';
+function flexpay_cb_disbursement_timeout(array $payload, array $gw): void
+{
+    $result = $payload['Result'] ?? $payload;
+    $refund = FlexPayStore::findRefundByIds((string) ($result['ConversationID'] ?? ''), (string) ($result['OriginatorConversationID'] ?? ''));
 
-    logTransaction($gw['name'], $payload, 'Disbursement ' . ucfirst($status) . ' – ' . $resultDesc);
+    logTransaction($gw['name'], $payload, 'Disbursement (B2C) Queue Timeout');
 
-    FlexPayStore::recordTransaction([
-        'channel'         => 'b2c',
-        'direction'       => 'out',
-        'conversation_id' => $conversationId,
-        'mpesa_receipt'   => $receipt,
-        'phone'           => $phone,
-        'amount'          => $amount,
-        'status'          => $status,
-        'result_code'     => (string) $resultCode,
-        'result_desc'     => $resultDesc ?: DarajaClient::describeResultCode($resultCode),
-        'raw_response'    => json_encode($result),
-    ]);
-
-    if ($conversationId) {
-        FlexPayStore::updateRefundByConversationId($conversationId, [
-            'status'      => $status,
-            'result_desc' => $resultDesc,
+    if ($refund && $refund->status === 'pending') {
+        FlexPayStore::updateRefund((int) $refund->id, [
+            'status'      => 'failed',
+            'result_desc' => 'Timed out in Safaricom\'s queue. Check with a Transaction Status query before retrying.',
         ]);
+        if (function_exists('logActivity')) {
+            logActivity('FlexPay: M-Pesa refund for Invoice #' . (int) $refund->invoice_id . ' timed out at Safaricom — verify and retry from the FlexPay Dashboard.');
+        }
     }
 
     flexpay_json_ok();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Transaction Reversal result
+// Transaction Reversal result / timeout
 // ═══════════════════════════════════════════════════════════════════════════════
-function flexpay_cb_reversal_result(array $payload, array $gw): void
+/**
+ * v3.4 marked Result.TransactionID as "reversed" — but that's the ID of the
+ * reversal itself, not of the payment being reversed, so the original was
+ * never flagged. The original is now taken from the reversal row recorded
+ * when the request was sent (matched by conversation IDs), falling back to
+ * the OriginalTransactionID result parameter.
+ */
+function flexpay_cb_reversal_result(array $payload, array $gw, bool $isTimeout): void
 {
-    $result     = $payload['Result'] ?? [];
-    $resultCode = (int) ($result['ResultCode'] ?? -1);
-    $resultDesc = (string) ($result['ResultDesc'] ?? '');
-    $transId    = (string) ($result['TransactionID'] ?? '');
+    $result         = $payload['Result'] ?? [];
+    $resultCode     = $isTimeout ? 'timeout' : (string) ($result['ResultCode'] ?? '-1');
+    $resultDesc     = $isTimeout ? 'Reversal timed out in Safaricom\'s queue.' : (string) ($result['ResultDesc'] ?? '');
+    $conversationId = (string) ($result['ConversationID'] ?? '');
+    $originatorId   = (string) ($result['OriginatorConversationID'] ?? '');
+    $reversalTxnId  = strtoupper((string) ($result['TransactionID'] ?? ''));
+    $params         = flexpay_cb_items($result['ResultParameters']['ResultParameter'] ?? [], 'Key', 'Value');
 
-    $status = ($resultCode === 0) ? 'success' : 'failed';
+    $success = $resultCode === '0';
 
-    logTransaction($gw['name'], $payload, 'Reversal ' . ucfirst($status) . ' – ' . $resultDesc);
+    logTransaction($gw['name'], $payload, 'Reversal ' . ($success ? 'Success' : 'Failed') . ' – ' . $resultDesc);
 
-    FlexPayStore::recordTransaction([
-        'channel'      => 'reversal',
-        'direction'    => 'out',
-        'mpesa_receipt' => $transId . '-REV', // avoid unique clash with original receipt
-        'status'       => $status,
-        'result_code'  => (string) $resultCode,
+    $row = null;
+    if ($conversationId !== '' || $originatorId !== '') {
+        $row = Capsule::table('flexpay_transactions')
+            ->where('channel', 'reversal')
+            ->where(function ($q) use ($conversationId, $originatorId) {
+                if ($conversationId !== '') {
+                    $q->orWhere('conversation_id', $conversationId);
+                }
+                if ($originatorId !== '') {
+                    $q->orWhere('originator_conversation_id', $originatorId);
+                }
+            })
+            ->first();
+    }
+
+    $original = strtoupper((string) ($row->account_reference ?? ($params['OriginalTransactionID'] ?? '')));
+
+    $update = [
+        'status'       => $success ? 'success' : 'failed',
+        'result_code'  => $resultCode,
         'result_desc'  => $resultDesc ?: DarajaClient::describeResultCode($resultCode),
         'raw_response' => json_encode($result),
-    ]);
+    ];
+    if ($success && preg_match('/^[A-Z0-9]{6,20}$/', $reversalTxnId) && !FlexPayStore::findTransactionByReceipt($reversalTxnId)) {
+        $update['mpesa_receipt'] = $reversalTxnId;
+    }
+    if (isset($params['Amount'])) {
+        $update['amount'] = (float) $params['Amount'];
+    }
 
-    // If reversal succeeded, mark the original transaction as reversed
-    if ($status === 'success' && $transId) {
-        try {
-            \WHMCS\Database\Capsule::table('flexpay_transactions')
-                ->where('mpesa_receipt', $transId)
-                ->update(['status' => 'reversed', 'updated_at' => date('Y-m-d H:i:s')]);
-        } catch (\Exception $e) {
-            // Non-fatal
+    if ($row) {
+        FlexPayStore::updateTransaction((int) $row->id, $update);
+    } else {
+        FlexPayStore::insertTransactionOnce(array_merge($update, [
+            'channel'                    => 'reversal',
+            'direction'                  => 'out',
+            'conversation_id'            => $conversationId,
+            'originator_conversation_id' => $originatorId,
+            'account_reference'          => $original,
+        ]));
+    }
+
+    if ($success && $original !== '') {
+        $originalRow = FlexPayStore::findTransactionByReceipt($original);
+        Capsule::table('flexpay_transactions')
+            ->where('mpesa_receipt', $original)
+            ->where('status', 'success')
+            ->update(['status' => 'reversed', 'updated_at' => FlexPayStore::now()]);
+
+        if (function_exists('logActivity')) {
+            logActivity('FlexPay: M-Pesa transaction ' . $original . ' was reversed'
+                . (($originalRow && $originalRow->invoice_id) ? ' — record the refund on Invoice #' . (int) $originalRow->invoice_id . ' in WHMCS if it was paid by this transaction.' : '.'));
         }
     }
 
@@ -651,29 +526,20 @@ function flexpay_cb_reversal_result(array $payload, array $gw): void
 function flexpay_cb_balance_result(array $payload, array $gw): void
 {
     $result     = $payload['Result'] ?? [];
-    $resultCode = (int) ($result['ResultCode'] ?? -1);
-
-    $params = [];
-    foreach (($result['ResultParameters']['ResultParameter'] ?? []) as $p) {
-        if (isset($p['Key'])) {
-            $params[$p['Key']] = $p['Value'] ?? null;
-        }
-    }
-
-    // AccountBalance comes back as a pipe-and-ampersand encoded string, e.g.:
-    // "Working Account|KES|481000.00|481000.00|0.00|0.00&Utility Account|KES|0.00|0.00|0.00|0.00"
-    $balanceStr = (string) ($params['AccountBalance'] ?? '');
-    $accounts   = flexpay_parse_balance_string($balanceStr);
+    $resultCode = (string) ($result['ResultCode'] ?? '-1');
+    $params     = flexpay_cb_items($result['ResultParameters']['ResultParameter'] ?? [], 'Key', 'Value');
 
     logTransaction($gw['name'], $payload, 'Balance Query Result – Code ' . $resultCode);
+    FlexPayStore::logApiCall('balance_result', ['code' => $resultCode], $result, $resultCode === '0', 'callback');
 
-    if ($resultCode === 0) {
+    if ($resultCode === '0') {
+        $accounts = flexpay_parse_balance_string((string) ($params['AccountBalance'] ?? ''));
         FlexPayStore::recordBalanceSnapshot([
-            'shortcode'        => $gw['businessShortcode'] ?? '',
-            'working_account'  => $accounts['working'] ?? 0,
-            'utility_account'  => $accounts['utility'] ?? 0,
-            'charges_account'  => $accounts['charges'] ?? 0,
-            'raw_response'     => json_encode($result),
+            'shortcode'       => DarajaClient::c2bShortcode($gw),
+            'working_account' => $accounts['working'],
+            'utility_account' => $accounts['utility'],
+            'charges_account' => $accounts['charges'],
+            'raw_response'    => json_encode($result),
         ]);
     }
 
@@ -681,34 +547,28 @@ function flexpay_cb_balance_result(array $payload, array $gw): void
 }
 
 /**
- * Parse Daraja's AccountBalance pipe-delimited string into a clean array.
+ * Parse Daraja's AccountBalance string, accounts separated by "&":
+ *   "{Name}|{Currency}|{Amount}|{Available}|{Reserved}|{Uncleared}"
  *
- * Format per account, separated by "&":
- *   "{Name}|{Currency}|{Total}|{Available}|{Reserved}|{Uncleared}"
- *
- * @param  string $raw
- * @return array  ['working' => float, 'utility' => float, 'charges' => float]
+ * @return array{working: float, utility: float, charges: float}
  */
 function flexpay_parse_balance_string(string $raw): array
 {
     $out = ['working' => 0.0, 'utility' => 0.0, 'charges' => 0.0];
-    if ($raw === '') {
-        return $out;
-    }
 
     foreach (explode('&', $raw) as $segment) {
-        $parts = explode('|', $segment);
+        $parts = explode('|', trim($segment));
         if (count($parts) < 3) {
             continue;
         }
         $name  = strtolower($parts[0]);
         $total = (float) $parts[2];
 
-        if (str_contains($name, 'working')) {
+        if (strpos($name, 'working') !== false) {
             $out['working'] = $total;
-        } elseif (str_contains($name, 'utility')) {
+        } elseif (strpos($name, 'utility') !== false) {
             $out['utility'] = $total;
-        } elseif (str_contains($name, 'charges')) {
+        } elseif (strpos($name, 'charges') !== false) {
             $out['charges'] = $total;
         }
     }
@@ -719,15 +579,104 @@ function flexpay_parse_balance_string(string $raw): array
 // ═══════════════════════════════════════════════════════════════════════════════
 // Transaction Status Query result
 // ═══════════════════════════════════════════════════════════════════════════════
+/**
+ * Status queries are sent by the customer "Verify your payment" box and the
+ * admin Verify tool when a receipt isn't on file. When the result confirms
+ * a completed payment INTO one of our shortcodes, it's recorded and:
+ *   - admin query with an invoice → applied to that invoice;
+ *   - customer query → applied only if the paying phone matches the
+ *     invoice's client; otherwise queued for one-click admin approval
+ *     (a receipt alone isn't enough to move a stranger's money onto an
+ *     invoice without a human looking at it).
+ */
 function flexpay_cb_status_result(array $payload, array $gw): void
 {
     $result     = $payload['Result'] ?? [];
-    $resultCode = (int) ($result['ResultCode'] ?? -1);
+    $resultCode = (string) ($result['ResultCode'] ?? '-1');
     $resultDesc = (string) ($result['ResultDesc'] ?? '');
+    $params     = flexpay_cb_items($result['ResultParameters']['ResultParameter'] ?? [], 'Key', 'Value');
 
     logTransaction($gw['name'], $payload, 'Status Query Result – Code ' . $resultCode . ': ' . $resultDesc);
 
-    FlexPayStore::logApiCall('status_async_result', $payload, $result, $resultCode === 0, 'system');
+    $context = FlexPayStore::takeStatusQueryContext($result);
+    FlexPayStore::logApiCall('status_async_result', ['context' => $context], $result, $resultCode === '0', 'callback');
+
+    if ($resultCode !== '0' || !$context) {
+        flexpay_json_ok();
+        return;
+    }
+
+    $receipt     = strtoupper((string) ($params['ReceiptNo'] ?? ''));
+    $status      = strtolower((string) ($params['TransactionStatus'] ?? ''));
+    $amount      = round((float) ($params['Amount'] ?? 0), 2);
+    $debitParty  = (string) ($params['DebitPartyName'] ?? '');
+    $creditParty = (string) ($params['CreditPartyName'] ?? '');
+    $creditCode  = trim(explode(' - ', $creditParty)[0]);
+    $invoiceId   = (int) ($context['invoice_id'] ?? 0);
+
+    $ourShortcodes = array_filter([DarajaClient::c2bShortcode($gw), DarajaClient::stkPartyB($gw), (string) ($gw['businessShortcode'] ?? '')]);
+
+    if ($receipt === '' || $receipt !== strtoupper((string) ($context['receipt'] ?? ''))
+        || $status !== 'completed' || $amount <= 0
+        || !in_array($creditCode, $ourShortcodes, true)) {
+        FlexPayStore::logApiCall('status_result_not_applicable', ['receipt' => $receipt, 'status' => $status, 'credit' => $creditCode], $context, false, 'callback');
+        flexpay_json_ok();
+        return;
+    }
+
+    if (FlexPayStore::findTransactionByReceipt($receipt)) {
+        flexpay_json_ok(); // already on file — nothing to do
+        return;
+    }
+
+    $payerPhone = trim(explode(' - ', $debitParty)[0]);
+    $rowId = FlexPayStore::insertTransactionOnce([
+        'channel'           => 'c2b',
+        'direction'         => 'in',
+        'mpesa_receipt'     => $receipt,
+        'phone'             => $payerPhone,
+        'amount'            => $amount,
+        'account_reference' => 'status-query',
+        'status'            => 'success',
+        'result_code'       => '0',
+        'result_desc'       => 'Confirmed by Transaction Status query (' . ($context['purpose'] ?? 'query') . ').',
+        'raw_response'      => json_encode($result),
+    ]);
+    if ($rowId === null) {
+        flexpay_json_ok();
+        return;
+    }
+
+    $autoApply = false;
+    if ($invoiceId > 0 && ($context['purpose'] ?? '') === 'admin_verify') {
+        $autoApply = true;
+    } elseif ($invoiceId > 0 && ($context['purpose'] ?? '') === 'customer_verify') {
+        $invoice = FlexPayStore::getInvoice($invoiceId);
+        $client  = $invoice ? Capsule::table('tblclients')->where('id', $invoice->userid)->first(['phonenumber']) : null;
+        $autoApply = $client && FlexPayStore::phoneMatches((string) $client->phonenumber, $payerPhone);
+    }
+
+    $row = FlexPayStore::findTransactionByReceipt($receipt);
+    if ($autoApply && $row) {
+        $applied = FlexPayStore::applyOrphanedTransaction($row, $invoiceId, (string) ($context['actor'] ?? $context['purpose']));
+        if ($applied['success']) {
+            flexpay_json_ok();
+            return;
+        }
+    }
+
+    FlexPayStore::storeUnmatched([
+        'trans_id'             => $receipt,
+        'amount'               => $amount,
+        'phone'                => $payerPhone,
+        'bill_ref'             => '(verified by status query)',
+        'customer_name'        => trim(implode(' - ', array_slice(explode(' - ', $debitParty), 1))),
+        'notes'                => $invoiceId > 0
+            ? "Customer on Invoice #{$invoiceId} submitted this receipt via self-verify; paying phone doesn't match the client's, so approve manually if correct."
+            : 'Confirmed by Transaction Status query; not linked to an invoice.',
+        'suggested_invoice_id' => $invoiceId ?: null,
+        'raw_data'             => json_encode($result),
+    ]);
 
     flexpay_json_ok();
 }
@@ -736,24 +685,29 @@ function flexpay_cb_status_result(array $payload, array $gw): void
 // Shared helpers
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function flexpay_lookup_pending_invoice(string $checkoutId): ?int
+/** Flatten Daraja's [{Name|Key: x, Value: y}, ...] lists into [x => y]. */
+function flexpay_cb_items($items, string $keyField, string $valueField): array
 {
-    try {
-        $row = \WHMCS\Database\Capsule::table('flexpay_transactions')
-            ->where('checkout_request_id', $checkoutId)
-            ->first(['invoice_id']);
-
-        return $row ? (int) $row->invoice_id : null;
-    } catch (\Exception $e) {
-        return null;
+    $out = [];
+    if (!is_array($items)) {
+        return $out;
     }
+    // A single item is sometimes sent as an object rather than a list.
+    if (isset($items[$keyField])) {
+        $items = [$items];
+    }
+    foreach ($items as $item) {
+        if (is_array($item) && isset($item[$keyField]) && is_scalar($item[$keyField])) {
+            $value = $item[$valueField] ?? null;
+            $out[(string) $item[$keyField]] = is_scalar($value) ? $value : null;
+        }
+    }
+    return $out;
 }
 
-function flexpay_cb_generic_timeout(array $payload, string $label): void
+function flexpay_cb_generic_timeout(array $payload, array $gw, string $label): void
 {
-    if (function_exists('logTransaction')) {
-        logTransaction('FlexPay (Daraja)', $payload, $label);
-    }
+    logTransaction($gw['name'], $payload, $label);
     flexpay_json_ok();
 }
 

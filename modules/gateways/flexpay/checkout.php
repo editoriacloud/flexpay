@@ -2,12 +2,18 @@
 /**
  * FlexPay Checkout — STK Push Initiator (AJAX endpoint)
  *
- * Called via HTTP POST by the JavaScript on the WHMCS invoice page.
+ * Called by the payment widget on the WHMCS invoice page.
+ *
+ * SECURITY: the browser supplies only the invoice ID, the signed invoice
+ * token issued when WHMCS rendered the widget, and the phone number to
+ * prompt. Everything else — amount, shortcode, passkey, account
+ * reference, callback URL — is derived server-side. (v3.4 accepted all of
+ * these from the browser, including the Daraja passkey, which was embedded
+ * in the invoice page for anyone to read.)
  *
  * Location: modules/gateways/flexpay/checkout.php
  *
- * POST parameters: invoice_id, amount, phone, shortcode, passkey,
- *                   txn_type, acc_ref, callback_url, csrf
+ * POST parameters: invoice_id, token, phone
  *
  * Response JSON:
  *   Success: { "success": true, "checkout_request_id": "ws_CO_...", "message": "..." }
@@ -16,116 +22,114 @@
 
 require_once __DIR__ . '/../../../init.php';
 require_once __DIR__ . '/../../../includes/gatewayfunctions.php';
+require_once __DIR__ . '/../../../includes/invoicefunctions.php';
 
+require_once __DIR__ . '/FlexPaySecurity.php';
 require_once __DIR__ . '/DarajaClient.php';
 require_once __DIR__ . '/FlexPayStore.php';
 require_once __DIR__ . '/FlexPayLicense.php';
+require_once __DIR__ . '/FlexPayService.php';
 
-header('Content-Type: application/json');
+FlexPaySecurity::jsonHeaders();
 
-if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-    http_response_code(405);
-    echo json_encode(['success' => false, 'message' => 'Method not allowed.']);
+function flexpay_checkout_respond(bool $success, string $message, array $extra = [], int $httpCode = 200): void
+{
+    http_response_code($httpCode);
+    echo json_encode(array_merge(['success' => $success, 'message' => $message], $extra));
     exit;
 }
 
-$invoiceId   = (int)    ($_POST['invoice_id']   ?? 0);
-$amount      = (int)    ($_POST['amount']        ?? 0);
-$phone       = (string) ($_POST['phone']         ?? '');
-$shortcode   = trim((string) ($_POST['shortcode']    ?? ''));
-$passkey     = trim((string) ($_POST['passkey']      ?? ''));
-$txnType     = trim((string) ($_POST['txn_type']     ?? 'CustomerPayBillOnline'));
-$accRef      = trim((string) ($_POST['acc_ref']      ?? ''));
-$callbackUrl = trim((string) ($_POST['callback_url'] ?? ''));
-$csrfToken   = trim((string) ($_POST['csrf']         ?? ''));
-
-// CSRF check
-if (empty($passkey) || !hash_equals(
-    hash_hmac('sha256', $invoiceId . '|' . $amount, $passkey),
-    $csrfToken
-)) {
-    echo json_encode(['success' => false, 'message' => 'Security token mismatch. Please reload the page.']);
-    exit;
+if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
+    flexpay_checkout_respond(false, 'Method not allowed.', [], 405);
 }
 
-if (!$invoiceId || $amount < 1 || empty($phone) || empty($shortcode) || empty($passkey)) {
-    echo json_encode(['success' => false, 'message' => 'Missing required payment parameters.']);
-    exit;
+$invoiceId = (int) ($_POST['invoice_id'] ?? 0);
+$token     = (string) ($_POST['token'] ?? '');
+$phone     = DarajaClient::formatPhone((string) ($_POST['phone'] ?? ''));
+
+if (!FlexPaySecurity::verifyInvoiceToken($invoiceId, $token)) {
+    flexpay_checkout_respond(false, 'Your session for this invoice has expired. Please reload the page.', [], 403);
 }
 
-if (!preg_match('/^254[17]\d{8}$/', $phone)) {
-    echo json_encode(['success' => false, 'message' => 'Invalid Safaricom phone number. Use format 07XXXXXXXX or 01XXXXXXXX.']);
-    exit;
+if ($phone === '') {
+    flexpay_checkout_respond(false, 'Invalid Safaricom phone number. Use format 07XXXXXXXX or 01XXXXXXXX.');
 }
 
 $gatewayParams = getGatewayVariables('flexpay');
+if (empty($gatewayParams['type'])) {
+    flexpay_checkout_respond(false, 'M-Pesa payment is temporarily unavailable. Please try another payment method.');
+}
 
-if (!$gatewayParams['type']) {
-    echo json_encode(['success' => false, 'message' => 'M-Pesa gateway is not active in WHMCS.']);
-    exit;
+// Abuse limits: STK pushes cost money-adjacent API calls and can be used to
+// spam a stranger's phone with PIN prompts.
+$ip = FlexPaySecurity::clientIp($gatewayParams);
+if (!FlexPaySecurity::rateLimit('stk_ip_' . $ip, 10, 600)
+    || !FlexPaySecurity::rateLimit('stk_inv_' . $invoiceId, 5, 300)
+    || !FlexPaySecurity::rateLimit('stk_phone_' . $phone, 3, 120)) {
+    flexpay_checkout_respond(false, 'Too many payment requests. Please wait a couple of minutes and try again.', [], 429);
 }
 
 $license = FlexPayLicense::check($gatewayParams);
 if (!$license['valid']) {
-    echo json_encode(['success' => false, 'message' => 'M-Pesa payment is temporarily unavailable. Please try another payment method.']);
-    exit;
+    flexpay_checkout_respond(false, 'M-Pesa payment is temporarily unavailable. Please try another payment method.');
 }
 
-$client = DarajaClient::fromGatewayParams($gatewayParams);
-
-if (strpos($callbackUrl, 'route=') === false) {
-    $callbackUrl .= (strpos($callbackUrl, '?') !== false ? '&' : '?') . 'route=stk_result';
+$invoice = FlexPayStore::getInvoice($invoiceId);
+if (!$invoice || !in_array($invoice->status, FlexPayStore::OPEN_INVOICE_STATUSES, true)) {
+    flexpay_checkout_respond(false, 'This invoice is not awaiting payment. Please reload the page.');
 }
 
-$response = $client->stkPush([
+$amount = FlexPayStore::invoiceBalanceInKes($invoiceId);
+if ($amount === null || $amount < 1) {
+    flexpay_checkout_respond(false, 'Nothing is due on this invoice. Please reload the page.');
+}
+
+$accRef    = FlexPayService::accountReference($gatewayParams, $invoiceId);
+$systemUrl = FlexPayStore::systemUrl($gatewayParams);
+$shortcode = (string) ($gatewayParams['businessShortcode'] ?? '');
+
+$response = DarajaClient::fromGatewayParams($gatewayParams)->stkPush([
     'shortcode'       => $shortcode,
-    'passkey'         => $passkey,
+    'passkey'         => (string) ($gatewayParams['passkey'] ?? ''),
     'amount'          => $amount,
     'phone'           => $phone,
-    'txnType'         => $txnType,
+    'txnType'         => ($gatewayParams['transactionType'] ?? '') ?: 'CustomerPayBillOnline',
+    'partyB'          => DarajaClient::stkPartyB($gatewayParams),
     'accountRef'      => $accRef,
-    'transactionDesc' => 'Invoice ' . $accRef,
-    'callbackUrl'     => $callbackUrl,
+    'transactionDesc' => 'Invoice ' . $invoiceId,
+    'callbackUrl'     => FlexPaySecurity::callbackUrl($systemUrl, 'stk_result'),
 ]);
 
-$success = isset($response['ResponseCode']) && (string) $response['ResponseCode'] === '0';
+$success = DarajaClient::isAccepted($response);
 
-FlexPayStore::logApiCall('stk_push', ['invoice_id' => $invoiceId, 'phone' => $phone, 'amount' => $amount], $response, $success, 'system');
+FlexPayStore::logApiCall('stk_push', ['invoice_id' => $invoiceId, 'phone' => $phone, 'amount' => $amount], $response, $success, 'customer');
+logTransaction('FlexPay (Daraja)', array_merge(['_invoice_id' => $invoiceId, '_phone' => $phone, '_amount' => $amount], $response), $success ? 'STK Push Initiated' : 'STK Push Rejected');
 
-logTransaction('FlexPay (Daraja)', array_merge(['_invoice_id' => $invoiceId, '_phone' => $phone], $response), 'STK Push Initiated');
+$checkoutId = (string) ($response['CheckoutRequestID'] ?? '');
 
-if ($success) {
-
-    $checkoutId = (string) ($response['CheckoutRequestID'] ?? '');
-    $merchantId = (string) ($response['MerchantRequestID'] ?? '');
-    $custMessage = (string) ($response['CustomerMessage'] ?? 'Request accepted');
-
-    if ($checkoutId) {
-        FlexPayStore::recordTransaction([
-            'channel'             => 'stk',
-            'direction'           => 'in',
-            'invoice_id'          => $invoiceId,
-            'checkout_request_id' => $checkoutId,
-            'merchant_request_id' => $merchantId,
-            'phone'               => $phone,
-            'amount'              => $amount,
-            'account_reference'   => $accRef,
-            'status'              => 'pending',
-            'raw_request'         => json_encode(['shortcode' => $shortcode, 'amount' => $amount, 'phone' => $phone]),
-        ]);
-    }
-
-    echo json_encode([
-        'success'             => true,
-        'checkout_request_id' => $checkoutId,
-        'message'             => $custMessage,
-    ]);
-
-} else {
-    $errMsg = $response['errorMessage']
-        ?? $response['ResponseDescription']
-        ?? $response['ResultDesc']
-        ?? 'STK Push request failed. Please try again.';
-
-    echo json_encode(['success' => false, 'message' => $errMsg]);
+if (!$success || $checkoutId === '') {
+    // Daraja's own errorMessage values are customer-safe ("Invalid PhoneNumber" etc.)
+    // but transport/internal details are not shown.
+    $message = !empty($response['errorMessage']) && is_string($response['errorMessage'])
+        ? $response['errorMessage']
+        : 'We could not send the payment prompt right now. Please try again, or pay manually using the details below.';
+    flexpay_checkout_respond(false, $message);
 }
+
+FlexPayStore::recordTransaction([
+    'channel'             => 'stk',
+    'direction'           => 'in',
+    'invoice_id'          => $invoiceId,
+    'client_id'           => (int) $invoice->userid,
+    'checkout_request_id' => $checkoutId,
+    'merchant_request_id' => (string) ($response['MerchantRequestID'] ?? ''),
+    'phone'               => $phone,
+    'amount'              => $amount,
+    'account_reference'   => $accRef,
+    'status'              => 'pending',
+    'raw_request'         => json_encode(['shortcode' => $shortcode, 'amount' => $amount, 'phone' => $phone, 'ip' => $ip]),
+]);
+
+flexpay_checkout_respond(true, (string) ($response['CustomerMessage'] ?? 'Prompt sent! Enter your M-Pesa PIN on your phone.'), [
+    'checkout_request_id' => $checkoutId,
+]);
