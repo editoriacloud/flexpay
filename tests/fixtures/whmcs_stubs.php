@@ -61,6 +61,8 @@ function fp_test_create_whmcs_tables(): void
     $schema->create('tblclients', function ($t) {
         $t->increments('id');
         $t->string('firstname')->default('');
+        $t->string('lastname')->default('');
+        $t->string('companyname')->default('');
         $t->string('phonenumber')->default('');
         $t->integer('currency')->default(1);
     });
@@ -80,6 +82,7 @@ function fp_test_create_whmcs_tables(): void
     });
     $schema->create('tblaccounts', function ($t) {
         $t->increments('id');
+        $t->integer('userid')->default(0);
         $t->integer('invoiceid')->default(0);
         $t->string('gateway')->default('');
         $t->string('transid')->default('');
@@ -143,9 +146,9 @@ function logTransaction($gateway, $data, $result)
     Manager::table('fp_test_log')->insert(['kind' => 'gateway', 'message' => (string) $result]);
 }
 
-function logActivity($message)
+function logActivity($message, $userId = 0)
 {
-    Manager::table('fp_test_log')->insert(['kind' => 'activity', 'message' => (string) $message]);
+    Manager::table('fp_test_log')->insert(['kind' => 'activity', 'message' => (string) $message . ($userId ? ' [client ' . (int) $userId . ']' : '')]);
 }
 
 function addInvoicePayment($invoiceId, $transId, $amount, $fees, $gateway)
@@ -236,6 +239,9 @@ function localAPI($command, $params, $admin = null)
             return ['result' => 'error', 'message' => 'Transaction ID must be unique'];
         }
         Manager::table('tblaccounts')->insert(['invoiceid' => (int) ($params['invoiceid'] ?? 0), 'gateway' => $params['paymentmethod'], 'transid' => $params['transid'], 'amountin' => $params['amountin']]);
+        return ['result' => 'success'];
+    }
+    if ($command === 'SendAdminEmail') {
         return ['result' => 'success'];
     }
     return ['result' => 'error', 'message' => 'unsupported in tests'];

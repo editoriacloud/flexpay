@@ -25,7 +25,7 @@
  *
  * @package   FlexPay\Gateway
  * @author    Editoria Cloud Systems <https://www.editoriaweb.co.ke>
- * @version   3.6.0
+ * @version   3.7.0
  * @link      https://developers.whmcs.com/payment-gateways/
  * @link      https://developer.safaricom.co.ke/
  */
@@ -524,7 +524,7 @@ function flexpay_link($params)
       var FAST_INTERVAL   = 3000;          // while an STK prompt is in flight
       var IDLE_INTERVAL   = 6000;          // ambient watch for a manual payment
       var IDLE_GIVE_UP_MS = 30 * 60 * 1000; // stop ambient polling after 30 minutes
-      var ICONS = { queued: '🔎', sent: '📱', processing: '⏳', confirmed: '🎉', failed: '❌' };
+      var ICONS = { queued: '🔎', sent: '📱', processing: '⏳', confirmed: '🎉', failed: '❌', review: '📥' };
       var STYLES = {
         info:    'background:#e8f4fd;color:#004085;border:1px solid #b8daff;',
         success: 'background:#d4edda;color:#155724;border:1px solid #c3e6cb;',
@@ -597,6 +597,13 @@ function flexpay_link($params)
               clearTimeout(pollTimer);
               status('error', ICONS.failed + ' ' + (d.message || 'Payment declined or cancelled.'));
               resetBtn();
+              return;
+            }
+            if (d.stage === 'review') {
+              // Received with the wrong account number: staff will confirm.
+              // Keep watching (slowly) so the page updates once they apply it.
+              status('info', ICONS.review + ' ' + d.message);
+              schedule(IDLE_INTERVAL * 2);
               return;
             }
             if (currentCheckout || d.stage !== 'queued') {

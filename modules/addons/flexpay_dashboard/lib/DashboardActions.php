@@ -138,6 +138,9 @@ class FlexPayDashboardActions
         }
 
         $result = FlexPayService::initiateStk($gw, $invoiceId, (string) ($post['phone'] ?? ''), $adminUsername);
+        if ($result['success']) {
+            FlexPayStore::adminActivity("M-Pesa payment prompt for Invoice #{$invoiceId} sent by {$adminUsername}", FlexPayStore::invoiceClientId($invoiceId));
+        }
         return $result['success']
             ? ['success' => true, 'message' => "M-Pesa prompt for KES " . number_format((float) $result['amount']) . " sent for Invoice #{$invoiceId}. The invoice updates automatically once the customer enters their PIN."]
             : ['success' => false, 'message' => 'Prompt not sent: ' . $result['message']];
@@ -278,6 +281,9 @@ class FlexPayDashboardActions
             'status'                     => 'pending',
             'result_desc'                => 'Reversal requested by ' . $adminUsername,
         ]);
+
+        FlexPayStore::adminActivity("M-Pesa reversal of {$transactionId} (KES {$amount}) requested by {$adminUsername}",
+            ($original && $original->invoice_id) ? FlexPayStore::invoiceClientId((int) $original->invoice_id) : null);
 
         return ['success' => true, 'message' => "Reversal request submitted for {$transactionId}. The result will appear in Transactions shortly."];
     }
@@ -474,6 +480,8 @@ class FlexPayDashboardActions
         ]);
 
         FlexPayStore::updateRefund((int) $refund->id, ['retried_as' => $newId ?: null]);
+        FlexPayStore::adminActivity('M-Pesa refund of KES ' . number_format((float) $refund->amount, 2) . ' for Invoice #' . (int) $refund->invoice_id
+            . ' re-sent by ' . $adminUsername . ($success ? '' : ' (rejected by Safaricom)'), FlexPayStore::invoiceClientId((int) $refund->invoice_id));
 
         return $success
             ? ['success' => true, 'message' => 'Refund re-sent to Safaricom. Its result will appear on this tab shortly.']

@@ -15,7 +15,7 @@
  *   - Dynamic QR code generation
  *
  * @package   FlexPay\Daraja
- * @version   3.6.0
+ * @version   3.7.0
  * @link      https://developer.safaricom.co.ke/Documentation
  */
 
@@ -27,7 +27,7 @@ class DarajaClient
 {
     private const SANDBOX_URL = 'https://sandbox.safaricom.co.ke';
     private const LIVE_URL    = 'https://api.safaricom.co.ke';
-    private const USER_AGENT  = 'FlexPay-Daraja-Client/3.6';
+    private const USER_AGENT  = 'FlexPay-Daraja-Client/3.7';
 
     /** @deprecated Use FlexPaySecurity::SAFARICOM_CALLBACK_IPS */
     public const SAFARICOM_CALLBACK_IPS = FlexPaySecurity::SAFARICOM_CALLBACK_IPS;

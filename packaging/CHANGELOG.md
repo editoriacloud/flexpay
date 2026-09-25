@@ -1,5 +1,46 @@
 # Changelog
 
+## v3.7.0 — Rigid manual paths, customer feedback, admin alerts, self-healing ledger
+
+### Money safety
+- **Every** path that credits an invoice now requires it to be open
+  (Unpaid / Overdue / Payment Pending). This includes admin Apply,
+  admin/customer Verify and status-query results. Before, those manual
+  paths could put money on a Paid, Refunded or Collections invoice, where
+  it silently became overpayment credit. Use *Credit to client* for money
+  that belongs on a client's balance.
+- **Self-healing ledger check.** If a callback died after recording a
+  receipt but before queueing or crediting it (PHP timeout, fatal error,
+  restart), Safaricom's retry saw the receipt and stopped, and the payment
+  was invisible. Now Safaricom's retry heals that payment immediately, and
+  every cron run checks that each unapplied incoming payment is in
+  Reconciliation. A payment WHMCS already credited is linked, never
+  credited again. Each row is repaired independently.
+
+### Customer experience
+- A customer who pays from their own number with the wrong reference no
+  longer sees "Waiting for payment…" forever. The invoice page says the
+  payment arrived and staff will confirm it, and Reconciliation pins that
+  invoice as the suggestion. Hardened for a public endpoint:
+  - the look-back is capped at 30 minutes;
+  - only exact (full or hashed) phone matches count;
+  - payments already suggested for another invoice are ignored;
+  - no receipt, amount or reference is disclosed;
+  - an invoice that is paid or cancelled always takes precedence.
+
+### Operations (WHMCS-native)
+- *Email Admins* (new addon setting, on by default): one WHMCS system
+  notification per cron run (`SendAdminEmail`) listing new unmatched
+  payments and failed refunds. Watermarks never skip or repeat items; the
+  first run only sets a baseline. Links respect a custom admin folder.
+- Every manual money action (apply, credit, dismiss, refund retry,
+  reversal, admin STK prompt) is written to the WHMCS Activity Log,
+  attributed to the admin and linked to the client.
+- Reconciliation tab: search, total value waiting, age of each payment
+  (red after 24h), and the suggested invoice's client, status and
+  balance, loaded in batched queries.
+
+
 ## v3.6.0 — Rigid reference-only matching, native WHMCS integration
 
 ### Critical fix: invoices marked paid by payments with a different reference

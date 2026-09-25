@@ -694,6 +694,91 @@ foreach ($ml as $l) {
 check('Daraja calls reach the WHMCS Module Log with credentials redacted', count($ml) > 0 && !$mlLeak);
 
 // ═════════════════════════════════════════════════════════════════════════════
+section('Rigid manual paths, customer feedback, alerts, self-healing');
+// ═════════════════════════════════════════════════════════════════════════════
+$u = DB::table('flexpay_unmatched_payments')->where('trans_id', 'RIGID00003')->first();
+$res = FlexPayDashboardActions::handle(['fp_action' => 'reconcile', 'unmatched_id' => $u->id, 'invoice_id' => 12, 'fp_csrf' => $csrf], 'boss');
+check('admin cannot apply money to an already-PAID invoice (use Credit instead)', !$res['success'] && stripos($res['message'], 'Credit to client') !== false && count(ledger(12)) === 0, $res['message']);
+check('…and the payment stays in the queue', (int) DB::table('flexpay_unmatched_payments')->where('id', $u->id)->value('matched') === 0);
+
+$res = FlexPayDashboardActions::handle(['fp_action' => 'reconcile', 'unmatched_id' => $u->id, 'invoice_id' => 21, 'fp_csrf' => $csrf], 'boss');
+check('manual reconciliation is written to the WHMCS Activity Log, linked to the client', $res['success']
+    && DB::table('fp_test_log')->where('kind', 'activity')->where('message', 'like', '%RIGID00003%applied to Invoice #21 by boss [client 3]%')->exists());
+
+// Customer paid with the wrong reference from their own phone while viewing the invoice.
+$inv(31, 3, 1800);
+$since = time() - 5;
+http('POST', cbUrl('c2b_receipt'), [], c2bPayload('WRONGREF31', 1800, 'CHEBET', '254733999888'));
+[$code, $res] = http('GET', '/modules/gateways/flexpay/poll.php', ['invoice_id' => 31, 'token' => FlexPaySecurity::invoiceToken(31), 'since' => $since]);
+check('poll tells the customer a wrong-reference payment arrived (stage "review"), not paid', ($res['stage'] ?? '') === 'review' && !($res['paid'] ?? true)
+    && invoiceStatus(31) === 'Unpaid', json_encode($res));
+check('…without disclosing receipt, amount or reference', $res['receipt'] === null && $res['amount'] === null
+    && strpos($res['message'], 'CHEBET') === false && strpos($res['message'], '1800') === false && strpos($res['message'], 'WRONGREF31') === false);
+check('…and pins that invoice as the suggestion for staff', (int) DB::table('flexpay_unmatched_payments')->where('trans_id', 'WRONGREF31')->value('suggested_invoice_id') === 31);
+[$code, $res] = http('GET', '/modules/gateways/flexpay/poll.php', ['invoice_id' => 30, 'token' => FlexPaySecurity::invoiceToken(30), 'since' => $since]);
+check('another customer\'s invoice page is not told about it', ($res['stage'] ?? '') !== 'review');
+
+// Attack: attacker sets their profile phone to the victim's and asks for since=1.
+$inv(33, 2, 999);
+DB::table('flexpay_unmatched_payments')->where('trans_id', 'WRONGREF31')->update(['suggested_invoice_id' => null]);
+DB::table('flexpay_unmatched_payments')->where('trans_id', 'WRONGREF31')->update(['created_at' => date('Y-m-d H:i:s', time() - 7200)]);
+DB::table('tblclients')->where('id', 2)->update(['phonenumber' => '0733999888']);
+[$code, $res] = http('GET', '/modules/gateways/flexpay/poll.php', ['invoice_id' => 33, 'token' => FlexPaySecurity::invoiceToken(33), 'since' => 1]);
+check('look-back is capped at 30 minutes whatever "since" says', ($res['stage'] ?? '') !== 'review'
+    && DB::table('flexpay_unmatched_payments')->where('trans_id', 'WRONGREF31')->value('suggested_invoice_id') === null, json_encode($res));
+DB::table('tblclients')->where('id', 2)->update(['phonenumber' => '+254 722 000 111']);
+DB::table('flexpay_unmatched_payments')->where('trans_id', 'WRONGREF31')->update(['suggested_invoice_id' => 31, 'created_at' => date('Y-m-d H:i:s')]);
+
+http('POST', cbUrl('c2b_receipt'), [], c2bPayload('MASKED0001', 50, 'ZZZ', '2547*****888'));
+$inv(34, 3, 60);
+[$code, $res] = http('GET', '/modules/gateways/flexpay/poll.php', ['invoice_id' => 34, 'token' => FlexPaySecurity::invoiceToken(34), 'since' => time() - 5]);
+check('a masked MSISDN never counts as "your number"', (int) DB::table('flexpay_unmatched_payments')->where('trans_id', 'MASKED0001')->value('suggested_invoice_id') !== 34);
+
+DB::table('tblinvoices')->where('id', 31)->update(['status' => 'Paid']);
+[$code, $res] = http('GET', '/modules/gateways/flexpay/poll.php', ['invoice_id' => 31, 'token' => FlexPaySecurity::invoiceToken(31), 'since' => $since]);
+check('once staff settle the invoice, the page shows paid (status wins over "review")', ($res['paid'] ?? false) === true, json_encode($res));
+DB::table('tblinvoices')->where('id', 31)->update(['status' => 'Unpaid']);
+
+// Admin digest (first run only records a baseline).
+DB::table('fp_test_log')->where('kind', 'localapi')->where('message', 'like', 'SendAdminEmail%')->delete();
+FlexPayStore::deleteSetting('notify_last_unmatched_id');
+FlexPayStore::deleteSetting('notify_last_refund_scan');
+$d = FlexPayService::sendAdminDigest('https://billing.example.com');
+check('admin digest: first run sets a baseline without emailing the backlog', !$d['sent'] && !DB::table('fp_test_log')->where('message', 'like', 'SendAdminEmail%')->exists());
+http('POST', cbUrl('c2b_receipt'), [], c2bPayload('DIGEST0001', 555, 'WHO KNOWS', '254700000077'));
+$d = FlexPayService::sendAdminDigest('https://billing.example.com');
+$mail = (string) DB::table('fp_test_log')->where('message', 'like', 'SendAdminEmail%')->value('message');
+check('admin digest emails new unmatched payments via WHMCS SendAdminEmail', $d['sent'] && $d['unmatched'] === 1 && strpos($mail, 'DIGEST0001') !== false && strpos($mail, '"type":"system"') !== false, $mail);
+check('…and never repeats them', !FlexPayService::sendAdminDigest('https://billing.example.com')['sent']);
+sleep(1);
+DB::table('flexpay_refunds')->insert(['invoice_id' => 1, 'phone' => '254712345678', 'amount' => 77, 'status' => 'failed', 'result_desc' => 'Rejected at once', 'created_at' => date('Y-m-d H:i:s')]);
+sleep(1);
+$d = FlexPayService::sendAdminDigest('https://billing.example.com');
+check('admin digest includes a refund rejected immediately (no updated_at)', $d['sent'] && $d['refunds'] === 1, json_encode($d));
+
+// Interrupted callback: receipt recorded, never queued.
+DB::table('flexpay_transactions')->insert(['channel' => 'c2b', 'direction' => 'in', 'mpesa_receipt' => 'CRASHED001', 'phone' => '254700000088', 'amount' => 999, 'account_reference' => 'XX',
+    'status' => 'success', 'result_desc' => 'Received — matching…', 'created_at' => date('Y-m-d H:i:s', time() - 900), 'updated_at' => date('Y-m-d H:i:s', time() - 900)]);
+$inv(32, 1, 400);
+DB::table('tblaccounts')->insert(['invoiceid' => 32, 'gateway' => 'flexpay', 'transid' => 'CRASHED002', 'amountin' => 400]);
+DB::table('flexpay_transactions')->insert(['channel' => 'c2b', 'direction' => 'in', 'mpesa_receipt' => 'CRASHED002', 'phone' => '254700000088', 'amount' => 400, 'account_reference' => 'INV-32',
+    'status' => 'success', 'result_desc' => 'Received — matching…', 'created_at' => date('Y-m-d H:i:s', time() - 900), 'updated_at' => date('Y-m-d H:i:s', time() - 900)]);
+http('POST', cbUrl('c2b_receipt'), [], c2bPayload('CRASHED001', 999, 'XX'));
+check('a Safaricom retry of an interrupted callback does not double-process', DB::table('flexpay_transactions')->where('mpesa_receipt', 'CRASHED001')->count() === 1);
+check('…and heals it immediately: the payment is queued for reconciliation', DB::table('flexpay_unmatched_payments')->where('trans_id', 'CRASHED001')->where('matched', 0)->exists());
+$r = FlexPayStore::repairUnqueuedPayments();
+check('ledger check links a payment WHMCS already credited instead of queueing it', $r['linked'] === 1 && (int) FlexPayStore::findTransactionByReceipt('CRASHED002')->invoice_id === 32
+    && !DB::table('flexpay_unmatched_payments')->where('trans_id', 'CRASHED002')->exists());
+check('ledger check is idempotent', FlexPayStore::repairUnqueuedPayments() === ['linked' => 0, 'queued' => 0, 'errors' => 0]);
+
+$_GET = ['fp_tab' => 'reconciliation', 'q' => 'crashed001'];
+ob_start();
+flexpay_dashboard_output($vars ?? ['modulelink' => 'addonmodules.php?module=flexpay_dashboard', 'access_roles' => 'Full Administrator', 'default_lookback_days' => '30']);
+$recon = ob_get_clean();
+check('Reconciliation search filters the queue and shows totals/age', strpos($recon, 'CRASHED001') !== false && strpos($recon, 'WRONGREF31') === false
+    && strpos($recon, 'payment(s) waiting') !== false && strpos($recon, ' ago') !== false);
+
+// ═════════════════════════════════════════════════════════════════════════════
 section('Dashboard rendering & access');
 // ═════════════════════════════════════════════════════════════════════════════
 $vars = ['modulelink' => 'addonmodules.php?module=flexpay_dashboard', 'access_roles' => 'Full Administrator', 'default_lookback_days' => '30'];

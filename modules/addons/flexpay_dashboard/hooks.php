@@ -71,24 +71,40 @@ function flexpay_dashboard_hook_settings(): array
 }
 
 add_hook('AfterCronJob', 1, function () {
+    $settings = flexpay_dashboard_hook_settings();
+
+    // Settle/fail STK pushes whose Safaricom callback never arrived.
     try {
-        $settings = flexpay_dashboard_hook_settings();
-        if (($settings['pending_sweeper'] ?? 'on') !== 'on') {
-            return;
-        }
-
         $gw = FlexPayStore::getFlexPayGatewayParams();
-        if (empty($gw['type'])) {
-            return;
-        }
-
-        $counts = FlexPayService::sweepPendingStk($gw, 20);
-        if ($counts['checked'] > 0) {
-            FlexPayStore::logApiCall('stk_sweeper', ['trigger' => 'cron'], $counts, true, 'cron');
+        if (($settings['pending_sweeper'] ?? 'on') === 'on' && !empty($gw['type'])) {
+            $counts = FlexPayService::sweepPendingStk($gw, 20);
+            if ($counts['checked'] > 0) {
+                FlexPayStore::logApiCall('stk_sweeper', ['trigger' => 'cron'], $counts, true, 'cron');
+            }
         }
     } catch (\Throwable $e) {
         if (function_exists('logActivity')) {
             logActivity('FlexPay: pending STK sweeper failed — ' . $e->getMessage());
+        }
+    }
+
+    // Make sure no recorded payment is missing from Reconciliation.
+    try {
+        FlexPayStore::repairUnqueuedPayments();
+    } catch (\Throwable $e) {
+        if (function_exists('logActivity')) {
+            logActivity('FlexPay: ledger check failed — ' . $e->getMessage());
+        }
+    }
+
+    // Email admins about new unmatched payments / failed refunds.
+    try {
+        if (($settings['notify_admins'] ?? 'on') === 'on') {
+            FlexPayService::sendAdminDigest(FlexPayStore::systemUrl());
+        }
+    } catch (\Throwable $e) {
+        if (function_exists('logActivity')) {
+            logActivity('FlexPay: admin notification failed — ' . $e->getMessage());
         }
     }
 });

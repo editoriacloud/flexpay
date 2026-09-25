@@ -214,6 +214,67 @@ class FlexPayViews
         return '<div class="fp-alert ' . $class . '">' . $icon . ' ' . htmlspecialchars($result['message']) . '</div>';
     }
 
+    /**
+     * Suggested invoices for a page of Reconciliation rows, with client name
+     * and outstanding balance — three queries total instead of three per row.
+     *
+     * @return array<int, object> keyed by invoice ID: id, userid, status, client_name, balance
+     */
+    private static function loadSuggestions(array $items): array
+    {
+        $ids = array_values(array_unique(array_filter(array_map(function ($i) {
+            return (int) $i->suggested_invoice_id;
+        }, $items))));
+        if (!$ids) {
+            return [];
+        }
+
+        try {
+            $cap      = \WHMCS\Database\Capsule::class;
+            $invoices = FlexPayStore::rows($cap::table('tblinvoices as i')
+                ->leftJoin('tblclients as c', 'c.id', '=', 'i.userid')
+                ->whereIn('i.id', $ids)
+                ->get(['i.id', 'i.userid', 'i.status', 'i.total', 'c.firstname', 'c.lastname', 'c.companyname']));
+            $paid = FlexPayStore::rows($cap::table('tblaccounts')->whereIn('invoiceid', $ids)
+                ->groupBy('invoiceid')
+                ->selectRaw('invoiceid, COALESCE(SUM(amountin), 0) - COALESCE(SUM(amountout), 0) AS paid')
+                ->get());
+        } catch (\Throwable $e) {
+            return [];
+        }
+
+        $paidBy = [];
+        foreach ($paid as $p) {
+            $paidBy[(int) $p->invoiceid] = (float) $p->paid;
+        }
+
+        $out = [];
+        foreach ($invoices as $inv) {
+            $inv->client_name = trim((string) ($inv->companyname ?? '')) !== ''
+                ? trim((string) $inv->companyname)
+                : trim(($inv->firstname ?? '') . ' ' . ($inv->lastname ?? ''));
+            $inv->balance = round((float) $inv->total - ($paidBy[(int) $inv->id] ?? 0.0), 2);
+            $out[(int) $inv->id] = $inv;
+        }
+        return $out;
+    }
+
+    /** Compact human age: "45s", "12m", "5h", "3d". */
+    private static function age(int $timestamp): string
+    {
+        $d = max(0, time() - $timestamp);
+        if ($d < 60) {
+            return $d . 's';
+        }
+        if ($d < 3600) {
+            return intdiv($d, 60) . 'm';
+        }
+        if ($d < 86400) {
+            return intdiv($d, 3600) . 'h';
+        }
+        return intdiv($d, 86400) . 'd';
+    }
+
     /** Shorthand HTML escaper. */
     private static function e($value): string
     {
@@ -483,29 +544,62 @@ class FlexPayViews
     // Reconciliation tab
     // ─────────────────────────────────────────────────────────────────────
 
-    public static function renderReconciliation(string $modulelink): string
+    public static function renderReconciliation(string $modulelink, array $get = []): string
     {
-        $items = FlexPayStore::listUnmatched(true);
+        $all    = FlexPayStore::listUnmatched(true);
+        $search = strtolower(trim(substr((string) ($get['q'] ?? ''), 0, 60)));
+        $items  = $search === '' ? $all : array_values(array_filter($all, function ($i) use ($search) {
+            $hay = strtolower(implode(' ', [$i->trans_id, $i->phone, DarajaClient::toDisplayPhone((string) $i->phone), $i->bill_ref, $i->customer_name, number_format((float) $i->amount, 2, '.', ''), (string) $i->suggested_invoice_id]));
+            return strpos($hay, $search) !== false;
+        }));
 
         $html = '<p style="color:#888;font-size:13px;margin-bottom:14px;">FlexPay only applies a payment automatically when its account reference is exactly one open invoice. Everything else lands here: a different or mistyped account number, Till payments (no reference), or a reference to an invoice that is already paid or cancelled. Suggestions from the payer\'s phone and the amount are pre-filled but never applied without you. '
             . 'Apply each one to the right invoice — it is recorded exactly as if it had matched automatically — or dismiss payments that aren\'t for any invoice.</p>';
 
-        if (empty($items)) {
+        if (empty($all)) {
             return $html . '<div class="fp-card" style="text-align:center;color:#888;padding:30px;">&#9989; No unmatched payments. Everything is reconciled.</div>';
         }
 
+        $total  = array_sum(array_map(function ($i) {
+            return (float) $i->amount;
+        }, $all));
+        $oldest = min(array_map(function ($i) {
+            return strtotime((string) $i->created_at);
+        }, $all));
+
+        $html .= '<form method="get" action="addonmodules.php" style="margin-bottom:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">'
+            . '<input type="hidden" name="module" value="flexpay_dashboard"><input type="hidden" name="fp_tab" value="reconciliation">'
+            . '<input class="fp-input" type="text" name="q" placeholder="Search receipt, phone, reference, amount, invoice…" value="' . self::e($search) . '" style="min-width:280px;">'
+            . '<button type="submit" class="fp-btn">Search</button>'
+            . '<span style="font-size:13px;color:#555;"><strong>' . count($all) . '</strong> payment(s) waiting · <strong>KES ' . number_format($total, 2) . '</strong> · oldest ' . self::e(self::age($oldest)) . ' old</span>'
+            . '</form>';
+
+        if (empty($items)) {
+            return $html . '<div class="fp-card" style="text-align:center;color:#888;padding:20px;">No unmatched payments match "' . self::e($search) . '".</div>';
+        }
+
         $html .= '<table class="fp-table"><thead><tr>'
-            . '<th>Date</th><th>Receipt</th><th>Phone</th><th>Customer Name</th><th>Entered Reference</th>'
+            . '<th>Received</th><th>Receipt</th><th>Phone</th><th>Customer Name</th><th>Entered Reference</th>'
             . '<th>Amount</th><th>Apply to Invoice</th><th>Credit to Client</th><th></th></tr></thead><tbody>';
+
+        $suggestions = self::loadSuggestions($items);
 
         foreach ($items as $item) {
             $hint      = trim((string) ($item->notes ?? ''));
             $suggested = $item->suggested_invoice_id ? (int) $item->suggested_invoice_id : '';
-            $suggestedInvoice = $suggested !== '' ? FlexPayStore::getInvoice((int) $suggested) : null;
+            $suggestedInvoice = $suggested !== '' ? ($suggestions[(int) $suggested] ?? null) : null;
             $suggestedClient  = $suggestedInvoice ? (int) $suggestedInvoice->userid : '';
 
+            $ageSeconds = time() - strtotime((string) $item->created_at);
+            $suggestionInfo = '';
+            if ($suggestedInvoice) {
+                $suggestionInfo = '<div style="font-size:11px;color:#666;margin-top:3px;">Suggested #' . (int) $suggestedInvoice->id
+                    . ($suggestedInvoice->client_name !== '' ? ' · ' . self::e($suggestedInvoice->client_name) : '') . ' · ' . self::e($suggestedInvoice->status)
+                    . ' · balance ' . number_format((float) $suggestedInvoice->balance, 2) . '</div>';
+            }
+
             $html .= '<tr>'
-                . '<td>' . self::e($item->created_at) . '</td>'
+                . '<td title="' . self::e($item->created_at) . '"' . ($ageSeconds > 86400 ? ' style="color:#c0392b;font-weight:600;"' : '') . '>' . self::e(self::age(strtotime((string) $item->created_at))) . ' ago</td>'
                 . '<td>' . self::e($item->trans_id) . '</td>'
                 . '<td>' . self::e(self::displayPhone((string) $item->phone)) . '</td>'
                 . '<td>' . self::e($item->customer_name ?: '—') . '</td>'
@@ -517,7 +611,7 @@ class FlexPayViews
                 . '<input type="hidden" name="unmatched_id" value="' . (int) $item->id . '">'
                 . '<input class="fp-input" style="width:90px;" type="number" min="1" name="invoice_id" placeholder="Inv #" value="' . self::e($suggested) . '" required>'
                 . '<button type="submit" class="fp-btn" style="padding:6px 12px;" onclick="return confirm(\'Apply KES ' . number_format((float) $item->amount, 2) . ' to this invoice?\');">Apply</button>'
-                . '</form>'
+                . '</form>' . $suggestionInfo
                 . '</td><td>'
                 . '<form method="post" style="display:flex;gap:6px;margin:0;">' . FlexPaySecurity::csrfField()
                 . '<input type="hidden" name="fp_action" value="credit_client">'

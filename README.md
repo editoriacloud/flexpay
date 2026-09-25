@@ -69,6 +69,22 @@ balance, or dismiss it. STK payments carry FlexPay's own `INV-42`
 reference, so they credit their invoice, but only while it is still open.
 Customer self-verification queues payments for staff approval by default.
 
+Every path that puts money on an invoice (automatic, admin Apply,
+Verify) requires the invoice to be **open** (Unpaid, Overdue or Payment
+Pending). Money for a client with nothing open goes to their account
+balance via *Credit to client*.
+
+When a customer pays from their own phone with the wrong reference while
+the invoice page is open, the page tells them the payment arrived and staff
+will confirm it. It never applies the payment and never shows payment
+details. Admins get an email digest (WHMCS system notification) of new
+unmatched payments and failed refunds on each cron run. Every manual action
+is written to the WHMCS Activity Log.
+
+A ledger check runs on each cron run and on Safaricom retries. It makes sure
+no recorded payment can go missing from Reconciliation after an interrupted
+callback.
+
 With *C2B Validation Mode* = strict (and external validation enabled on
 your shortcode by Safaricom), payments whose account number would not
 match are refused at the customer's phone, before any money moves.

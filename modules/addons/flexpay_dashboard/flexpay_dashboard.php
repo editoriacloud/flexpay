@@ -11,7 +11,7 @@
  * Install location: modules/addons/flexpay_dashboard/flexpay_dashboard.php
  *
  * @package   FlexPay\Dashboard
- * @version   1.5.0
+ * @version   1.6.0
  * @link      https://developers.whmcs.com/addon-modules/
  */
 
@@ -35,7 +35,7 @@ function flexpay_dashboard_config()
     return [
         'name'        => 'FlexPay Dashboard (M-Pesa / Daraja)',
         'description' => 'Unified management console for the FlexPay M-Pesa gateway: transactions, refunds, C2B reconciliation, account balance, and API logs.',
-        'version'     => '1.5.0',
+        'version'     => '1.6.0',
         'author'      => 'Editoria Cloud Systems',
         'fields'      => [
             'access_roles' => [
@@ -57,6 +57,12 @@ function flexpay_dashboard_config()
                 'Type'         => 'yesno',
                 'Default'      => 'on',
                 'Description'  => 'On every WHMCS cron run, ask Safaricom about STK payments still pending after 2 minutes and settle/fail them — so a payment is credited even if its callback was lost and the customer closed the page.',
+            ],
+            'notify_admins' => [
+                'FriendlyName' => 'Email Admins',
+                'Type'         => 'yesno',
+                'Default'      => 'on',
+                'Description'  => 'Send a WHMCS system notification (one digest per cron run) when M-Pesa payments land in Reconciliation or a refund fails. Admins receive it if "System Emails" is ticked on their admin profile.',
             ],
             'daily_balance' => [
                 'FriendlyName' => 'Daily Balance Snapshot',
@@ -173,7 +179,7 @@ function flexpay_dashboard_output($vars)
             echo FlexPayViews::renderRefunds($modulelink);
             break;
         case 'reconciliation':
-            echo FlexPayViews::renderReconciliation($modulelink);
+            echo FlexPayViews::renderReconciliation($modulelink, $_GET);
             break;
         case 'balance':
             echo FlexPayViews::renderBalance($modulelink);

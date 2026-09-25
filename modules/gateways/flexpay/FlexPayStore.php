@@ -9,7 +9,7 @@
  * WHMCS invoice — so the rules for doing that safely live in one place.
  *
  * @package FlexPay\Daraja
- * @version 3.6.0
+ * @version 3.7.0
  */
 
 if (!defined('WHMCS')) {
@@ -620,7 +620,10 @@ class FlexPayStore
      * @param  int         $invoiceId
      * @param  string      $transId        Ledger transaction ID (receipt, or CheckoutRequestID when the receipt isn't known yet)
      * @param  float       $kesAmount      Amount actually received, in KES
-     * @param  string[]|null $allowedStatuses  Invoice statuses allowed (null = any status except Cancelled)
+     * @param  string[]|null $allowedStatuses  Invoice statuses allowed. null = OPEN_INVOICE_STATUSES:
+     *                                          money is never put on a Paid / Refunded / Collections /
+     *                                          Cancelled / Draft invoice (it would silently become
+     *                                          overpayment credit). Use creditUnmatchedToClient() for that.
      * @return array ['applied' => bool, 'reason' => string, 'message' => string, 'outcome' => array|null, 'invoice_id' => int]
      */
     public static function applyPaymentToInvoice(int $invoiceId, string $transId, float $kesAmount, ?array $allowedStatuses = null): array
@@ -638,8 +641,8 @@ class FlexPayStore
             return $fail('invoice_not_found', "Invoice #{$invoiceId} does not exist.");
         }
 
-        if ($allowedStatuses !== null ? !in_array($invoice->status, $allowedStatuses, true) : $invoice->status === 'Cancelled') {
-            return $fail('invoice_status', "Invoice #{$invoiceId} is {$invoice->status} — payment not auto-applied.");
+        if (!in_array($invoice->status, $allowedStatuses ?? self::OPEN_INVOICE_STATUSES, true)) {
+            return $fail('invoice_status', "Invoice #{$invoiceId} is {$invoice->status}, not awaiting payment — not applied. Use \"Credit to client\" to put the money on the client's account instead.");
         }
 
         if (self::transIdExists($transId)) {
@@ -1432,6 +1435,7 @@ class FlexPayStore
         ]);
         self::markUnmatchedResolved((string) $transaction->mpesa_receipt, $invoiceId, $actor);
         self::logApiCall('apply_payment', ['receipt' => $transaction->mpesa_receipt, 'invoice_id' => $invoiceId], ['message' => $apply['message']], true, $actor);
+        self::adminActivity("M-Pesa payment {$transaction->mpesa_receipt} (KES " . number_format((float) $transaction->amount, 2) . ") applied to Invoice #{$invoiceId} via {$actor}", self::invoiceClientId($invoiceId));
 
         return ['success' => true, 'message' => $apply['message'], 'outcome' => $apply['outcome']];
     }
@@ -1767,6 +1771,7 @@ class FlexPayStore
                 ]);
 
             self::logApiCall('reconcile', ['trans_id' => $row->trans_id, 'invoice_id' => $invoiceId], ['message' => $apply['message']], true, $adminUsername);
+            self::adminActivity("Unmatched M-Pesa payment {$row->trans_id} (KES " . number_format((float) $row->amount, 2) . ") applied to Invoice #{$invoiceId} by {$adminUsername}", self::invoiceClientId($invoiceId));
 
             return ['success' => true, 'message' => $apply['message'], 'outcome' => $apply['outcome']];
         } catch (\Throwable $e) {
@@ -1845,9 +1850,158 @@ class FlexPayStore
             'updated_at'  => self::now(),
         ]);
         self::logApiCall('credit_client', ['trans_id' => $row->trans_id, 'client_id' => $clientId, 'amount' => $amount], $result, true, $adminUsername);
+        self::adminActivity("Unmatched M-Pesa payment {$row->trans_id} credited to client account balance by {$adminUsername}", $clientId);
 
         $code = $currency ? strtoupper((string) $currency->code) : 'KES';
         return ['success' => true, 'message' => "{$code} " . number_format($amount, 2) . " added to client #{$clientId}'s credit balance."];
+    }
+
+    /**
+     * Did a payment from the invoice owner's own phone land in Reconciliation
+     * while they were on the invoice page? Used ONLY to tell that customer
+     * "it arrived, staff will confirm" instead of "waiting" forever — the
+     * payment is never applied here.
+     *
+     * Hardened because it runs on a public endpoint with caller-influenced
+     * inputs (the page's `since`, the phone on the caller's own profile):
+     *  - look-back is capped at 30 minutes whatever `since` says;
+     *  - only an EXACT phone match (full MSISDN or C2B v2 SHA-256 hash)
+     *    counts — masked MSISDNs are too collision-prone;
+     *  - payments already suggested for another invoice are ignored;
+     *  - the caller learns only that "a payment" arrived — never its
+     *    receipt, amount or reference;
+     *  - the Reconciliation hint tells staff to verify before applying.
+     */
+    public static function findUnmatchedFromInvoiceOwner(int $invoiceId, ?string $sinceDate): bool
+    {
+        self::ensureTables();
+
+        $floor = date('Y-m-d H:i:s', time() - 1800);
+        $since = ($sinceDate !== null && $sinceDate > $floor) ? $sinceDate : $floor;
+
+        try {
+            // Cheap indexed check first: nothing queued recently → done.
+            $recent = Capsule::table('flexpay_unmatched_payments')->where('matched', 0)->where('created_at', '>=', $since);
+            if (!(clone $recent)->exists()) {
+                return false;
+            }
+
+            $invoice = self::getInvoice($invoiceId);
+            if (!$invoice) {
+                return false;
+            }
+            $phone = DarajaClient::formatPhone((string) Capsule::table('tblclients')->where('id', $invoice->userid)->value('phonenumber'));
+            if ($phone === '') {
+                return false;
+            }
+            $hash = hash('sha256', $phone);
+
+            $rows = $recent->where(function ($w) use ($invoiceId) {
+                $w->whereNull('suggested_invoice_id')->orWhere('suggested_invoice_id', $invoiceId);
+            })->orderBy('created_at', 'desc')->take(500)->get(['id', 'phone', 'suggested_invoice_id', 'notes']);
+
+            foreach ($rows as $row) {
+                $observed = strtolower(trim(explode(' - ', (string) $row->phone)[0]));
+                $exact    = $observed === $hash || DarajaClient::formatPhone($observed) === $phone;
+                if (!$exact) {
+                    continue;
+                }
+                if ($row->suggested_invoice_id === null) {
+                    Capsule::table('flexpay_unmatched_payments')->where('id', $row->id)->whereNull('suggested_invoice_id')->update([
+                        'suggested_invoice_id' => $invoiceId,
+                        'notes'                => substr(trim('Came from the phone number on the client profile of Invoice #' . $invoiceId
+                            . ' while that invoice page was open — confirm with the customer before applying. ' . (string) $row->notes), 0, 255),
+                    ]);
+                }
+                return true;
+            }
+        } catch (\Throwable $e) {
+            return false;
+        }
+        return false;
+    }
+
+    /**
+     * Self-healing ledger check (cron): every successful INCOMING payment that
+     * isn't linked to an invoice must be visible in Reconciliation.
+     *
+     * A callback that dies mid-way (PHP timeout, fatal error, server restart)
+     * after recording the receipt but before queueing it would otherwise make
+     * the money invisible — Safaricom's retry sees the receipt and stops.
+     *
+     *  - Credited in the WHMCS ledger (tblaccounts) but not linked here →
+     *    link our row to that invoice (never credit again).
+     *  - Not credited and not queued → add to Reconciliation.
+     *
+     * @return array ['linked' => int, 'queued' => int]
+     */
+    public static function repairUnqueuedPayments(int $graceSeconds = 300, int $limit = 200, ?string $onlyReceipt = null): array
+    {
+        self::ensureTables();
+        $out = ['linked' => 0, 'queued' => 0, 'errors' => 0];
+
+        try {
+            $query = Capsule::table('flexpay_transactions as t')
+                ->leftJoin('flexpay_unmatched_payments as u', function ($j) {
+                    $j->on('u.trans_id', '=', 't.mpesa_receipt');
+                })
+                ->where('t.direction', 'in')
+                ->where('t.status', 'success')
+                ->whereNull('t.invoice_id')
+                ->whereNull('t.client_id')
+                ->whereNotNull('t.mpesa_receipt')
+                ->whereNull('u.id')
+                ->where('t.updated_at', '<=', date('Y-m-d H:i:s', time() - $graceSeconds));
+            if ($onlyReceipt !== null) {
+                $query->where('t.mpesa_receipt', $onlyReceipt);
+            }
+            $rows = self::rows($query->orderBy('t.id')->take($limit)->get(['t.*']));
+        } catch (\Throwable $e) {
+            self::activity('repairUnqueuedPayments failed — ' . $e->getMessage());
+            return $out;
+        }
+
+        foreach ($rows as $row) {
+            // One bad row must not stop the rest being repaired.
+            try {
+                $ledger = Capsule::table('tblaccounts')->where('transid', $row->mpesa_receipt)->first(['invoiceid', 'userid']);
+                if ($ledger && (int) ($ledger->invoiceid ?? 0) > 0) {
+                    Capsule::table('flexpay_transactions')->where('id', $row->id)->whereNull('invoice_id')->update([
+                        'invoice_id'  => (int) $ledger->invoiceid,
+                        'client_id'   => self::invoiceClientId((int) $ledger->invoiceid),
+                        'result_desc' => substr('Credited to Invoice #' . (int) $ledger->invoiceid . ' (link restored by ledger check).', 0, 255),
+                        'updated_at'  => self::now(),
+                    ]);
+                    $out['linked']++;
+                    continue;
+                }
+                if ($ledger) {
+                    // Credited to a client account without an invoice — nothing to queue.
+                    continue;
+                }
+
+                self::storeUnmatched([
+                    'trans_id' => (string) $row->mpesa_receipt,
+                    'amount'   => (float) $row->amount,
+                    'phone'    => (string) $row->phone,
+                    'bill_ref' => (string) $row->account_reference !== '' ? (string) $row->account_reference : '(none)',
+                    'notes'    => 'Recovered by the ledger check: this payment was recorded but never queued (interrupted callback). Verify before applying.',
+                ]);
+                Capsule::table('flexpay_transactions')->where('id', $row->id)->update([
+                    'result_desc' => 'No matching invoice found — needs manual reconciliation (recovered).',
+                    'updated_at'  => self::now(),
+                ]);
+                $out['queued']++;
+            } catch (\Throwable $e) {
+                $out['errors']++;
+                self::activity('ledger check failed for ' . $row->mpesa_receipt . ' — ' . $e->getMessage());
+            }
+        }
+
+        if ($out['linked'] || $out['queued'] || $out['errors']) {
+            self::logApiCall('ledger_repair', ['receipt' => $onlyReceipt], $out, $out['errors'] === 0, $onlyReceipt ? 'callback_retry' : 'cron');
+        }
+        return $out;
     }
 
     /** Payments in the Reconciliation queue suggested for an invoice. */
@@ -1877,6 +2031,8 @@ class FlexPayStore
                 return ['success' => false, 'message' => 'Payment not found or already resolved.'];
             }
             self::logApiCall('dismiss_unmatched', ['id' => $unmatchedId, 'reason' => $reason], ['dismissed' => true], true, $adminUsername);
+            $transId = (string) Capsule::table('flexpay_unmatched_payments')->where('id', $unmatchedId)->value('trans_id');
+            self::adminActivity("Unmatched M-Pesa payment {$transId} dismissed by {$adminUsername}" . ($reason !== '' ? " ({$reason})" : ''));
             return ['success' => true, 'message' => 'Payment dismissed from the reconciliation queue.'];
         } catch (\Throwable $e) {
             return ['success' => false, 'message' => 'Could not dismiss payment: ' . $e->getMessage()];
@@ -2262,5 +2418,23 @@ class FlexPayStore
         if (function_exists('logActivity')) {
             logActivity('FlexPay: ' . $message);
         }
+    }
+
+    /**
+     * Record a manual money action in the WHMCS Activity Log (Utilities →
+     * Logs → Activity Log), linked to the client so it also shows on their
+     * profile's log. WHMCS stamps the acting admin itself.
+     */
+    public static function adminActivity(string $message, ?int $clientId = null): void
+    {
+        if (function_exists('logActivity')) {
+            logActivity('FlexPay: ' . $message, (int) ($clientId ?? 0));
+        }
+    }
+
+    public static function invoiceClientId(int $invoiceId): ?int
+    {
+        $invoice = self::getInvoice($invoiceId);
+        return $invoice ? (int) $invoice->userid : null;
     }
 }

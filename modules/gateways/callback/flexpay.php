@@ -269,8 +269,11 @@ function flexpay_cb_c2b_receipt(array $payload, array $gw): void
         return;
     }
 
-    // Retried confirmation, or already recorded via the STK callback.
+    // Retried confirmation, or already recorded via the STK callback. If an
+    // earlier attempt died after recording the receipt but before queueing
+    // or linking it, heal that payment now rather than waiting for cron.
     if (FlexPayStore::findTransactionByReceipt($transId)) {
+        FlexPayStore::repairUnqueuedPayments(60, 1, $transId);
         flexpay_json_ok();
         return;
     }

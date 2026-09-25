@@ -138,6 +138,114 @@ class FlexPayService
     }
 
     // ─────────────────────────────────────────────────────────────────────
+    // Admin notifications
+    // ─────────────────────────────────────────────────────────────────────
+
+    /**
+     * Email admins (WHMCS SendAdminEmail, "system" notifications) about NEW
+     * payments waiting in Reconciliation and NEW failed refunds since the
+     * last digest. Called from the cron hook, so a burst of payments becomes
+     * one email per cron run. The first run on an existing install only
+     * records a starting point, so it never emails the historic backlog.
+     *
+     * @return array ['sent' => bool, 'unmatched' => int, 'refunds' => int]
+     */
+    public static function sendAdminDigest(string $systemUrl = ''): array
+    {
+        $out = ['sent' => false, 'unmatched' => 0, 'refunds' => 0];
+        $cap = \WHMCS\Database\Capsule::class;
+
+        // Watermarks: last unmatched row ID looked at (rows are append-only),
+        // and the time of the last refund scan (refunds FAIL later, via an
+        // async result, so an ID watermark would skip them).
+        $lastU = FlexPayStore::getSetting('notify_last_unmatched_id');
+        $lastR = FlexPayStore::getSetting('notify_last_refund_scan');
+        $scanStartedAt = FlexPayStore::now();
+        if ($lastU === null || $lastR === null) {
+            FlexPayStore::setSetting('notify_last_unmatched_id', (string) (int) $cap::table('flexpay_unmatched_payments')->max('id'));
+            FlexPayStore::setSetting('notify_last_refund_scan', $scanStartedAt);
+            return $out;
+        }
+
+        // Rows beyond the first 50 are picked up by the next run; the
+        // watermark only advances past rows actually looked at.
+        $batch     = FlexPayStore::rows($cap::table('flexpay_unmatched_payments')->where('id', '>', (int) $lastU)->orderBy('id')->take(50)->get());
+        $unmatched = array_values(array_filter($batch, function ($u) {
+            return !$u->matched;
+        }));
+        $newLastU  = $batch ? (int) end($batch)->id : (int) $lastU;
+
+        $refunds = FlexPayStore::rows($cap::table('flexpay_refunds')->where('status', 'failed')->whereNull('retried_as')
+            ->whereRaw('COALESCE(updated_at, created_at) > ?', [(string) $lastR])
+            ->whereRaw('COALESCE(updated_at, created_at) <= ?', [$scanStartedAt])
+            ->orderBy('id')->take(50)->get());
+
+        $out['unmatched'] = count($unmatched);
+        $out['refunds']   = count($refunds);
+
+        if (!$unmatched && !$refunds) {
+            FlexPayStore::setSetting('notify_last_unmatched_id', (string) $newLastU);
+            FlexPayStore::setSetting('notify_last_refund_scan', $scanStartedAt);
+            return $out;
+        }
+        if (!function_exists('localAPI')) {
+            return $out;
+        }
+
+        $e    = function ($v) {
+            return htmlspecialchars((string) $v, ENT_QUOTES, 'UTF-8');
+        };
+        $base = rtrim($systemUrl, '/');
+        $html = '';
+
+        if ($unmatched) {
+            $html .= '<p><strong>' . count($unmatched) . ' M-Pesa payment(s) could not be matched to an open invoice</strong> (the account reference did not match) and are waiting in Reconciliation:</p><ul>';
+            foreach ($unmatched as $u) {
+                $html .= '<li>' . $e($u->trans_id) . ' — KES ' . number_format((float) $u->amount, 2) . ' — reference "' . $e($u->bill_ref) . '"'
+                    . ($u->suggested_invoice_id ? ' — suggested Invoice #' . (int) $u->suggested_invoice_id : '') . '</li>';
+            }
+            $html .= '</ul>';
+        }
+        if ($refunds) {
+            $html .= '<p><strong>' . count($refunds) . ' M-Pesa refund(s) FAILED</strong> — WHMCS recorded the refund but no money reached the customer:</p><ul>';
+            foreach ($refunds as $r) {
+                $html .= '<li>Invoice #' . (int) $r->invoice_id . ' — KES ' . number_format((float) $r->amount, 2) . ' — ' . $e($r->result_desc) . '</li>';
+            }
+            $html .= '</ul>';
+        }
+        $html .= '<p><a href="' . $e($base) . '/' . $e(self::adminPath()) . '/addonmodules.php?module=flexpay_dashboard&amp;fp_tab=' . ($unmatched ? 'reconciliation' : 'refunds') . '">Open the FlexPay Dashboard</a></p>';
+
+        $subject = 'FlexPay: ' . implode(' and ', array_filter([
+            $unmatched ? count($unmatched) . ' M-Pesa payment(s) need reconciliation' : '',
+            $refunds ? count($refunds) . ' refund(s) failed' : '',
+        ]));
+
+        $result = localAPI('SendAdminEmail', ['customsubject' => $subject, 'custommessage' => $html, 'type' => 'system']);
+        if (($result['result'] ?? '') === 'success') {
+            FlexPayStore::setSetting('notify_last_unmatched_id', (string) $newLastU);
+            FlexPayStore::setSetting('notify_last_refund_scan', $scanStartedAt);
+            $out['sent'] = true;
+        }
+        FlexPayStore::logApiCall('admin_digest', ['unmatched' => $out['unmatched'], 'refunds' => $out['refunds']], $result, $out['sent'], 'cron');
+
+        return $out;
+    }
+
+    /** WHMCS admin directory (customisable via $customadminpath in configuration.php). */
+    private static function adminPath(): string
+    {
+        $path = '';
+        if (class_exists('App') && method_exists('App', 'get_admin_folder_name')) {
+            try {
+                $path = (string) \App::get_admin_folder_name();
+            } catch (\Throwable $e) {
+                $path = '';
+            }
+        }
+        return preg_match('/^[A-Za-z0-9_\-]+$/', $path) ? $path : 'admin';
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // C2B URL registration
     // ─────────────────────────────────────────────────────────────────────
 

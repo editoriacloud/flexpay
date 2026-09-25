@@ -19,6 +19,8 @@
  *                 checkout_id (optional)
  *
  * Response: { paid, failed, stage, message, receipt, amount, source }
+ *   stage "review": a payment arrived from the invoice owner's phone with a
+ *   different reference — received, awaiting staff confirmation.
  */
 
 require_once __DIR__ . '/../../../init.php';
@@ -132,6 +134,18 @@ if ($invoice && $invoice->status === 'Paid') {
 }
 if ($invoice && in_array($invoice->status, ['Cancelled', 'Refunded', 'Collections'], true)) {
     flexpay_poll_respond(false, true, 'failed', 'This invoice is ' . strtolower($invoice->status) . ' and can no longer be paid online.', null, null, 'invoice');
+}
+
+// ── Tier 4: paid from the owner's phone but with a different reference ────
+// Rigid matching means it is NOT applied; tell the customer it arrived and
+// is waiting for staff instead of "Waiting for payment…" forever. Runs after
+// the invoice-status tier so a paid/cancelled invoice always wins. No
+// receipt, amount or reference is disclosed (see the store method).
+if (FlexPayStore::findUnmatchedFromInvoiceOwner($invoiceId, $sinceDate)) {
+    flexpay_poll_respond(false, false, 'review',
+        'We received an M-Pesa payment from your number, but it was made with a different account number, so it isn\'t applied automatically. '
+        . 'Our team will confirm it and apply it to this invoice shortly — there is no need to pay again.',
+        null, null, 'unmatched');
 }
 
 flexpay_poll_respond(false, false, 'queued', 'Waiting for payment…', null, null, 'local');
