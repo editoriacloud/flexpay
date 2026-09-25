@@ -1,0 +1,12 @@
+{
+    "name": "editoriacloud/flexpay-tests",
+    "description": "Test harness for the FlexPay WHMCS module (not shipped in the release zip)",
+    "type": "project",
+    "require": {
+        "php": ">=8.1",
+        "illuminate/database": "^10.0"
+    },
+    "config": {
+        "sort-packages": true
+    }
+}
