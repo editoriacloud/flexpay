@@ -1,5 +1,68 @@
 # Changelog
 
+## v3.6.0 — Rigid reference-only matching, native WHMCS integration
+
+### Critical fix: invoices marked paid by payments with a different reference
+A payment whose account reference did not match could still mark an invoice
+paid when its amount matched. There were three paths:
+- **payer phone + amount** matching (on by default in 3.5.0);
+- **amount-only** matching (always on in 3.4.x and earlier);
+- linking a manual paybill payment to a pending STK push by **phone OR
+  reference**, so a payment with a different reference from the same phone
+  for the same amount settled that invoice's STK push.
+
+All three are removed. A payment is now applied automatically only when its
+account reference is exactly one open invoice. Everything else goes to
+Reconciliation, with phone/amount used only as a pre-filled suggestion:
+different or missing references (Till), ambiguous references, and
+references to paid or cancelled invoices. Both legacy settings are removed
+and ignored if still stored.
+
+Also:
+- Reference parsing is exact: the whole reference must be the invoice
+  number. `INV-42`, `inv 0042`, `#42` and `42` are accepted; `INV-42-A`,
+  `INV 23 and 24` and `PAY INV42` are refused. v3.5 took the first number
+  found after the prefix.
+- WHMCS invoice numbers (`invoicenum`, custom/sequential numbering) are
+  matched. A reference that is one invoice's ID and another's number counts
+  as ambiguous and is not applied.
+- Linking a C2B confirmation to our own STK push requires the exact same
+  reference. Only a reference-less (Till) echo is linked by phone + amount.
+  If a Till echo is queued before the STK result arrives, it is removed
+  from the queue when the STK confirms, so the payment exists and is
+  credited once.
+- STK payments credit their invoice only while it is still open. If the
+  invoice was paid or cancelled meanwhile, the payment goes to
+  Reconciliation instead of silently becoming account credit.
+- Strict C2B validation applies the same rules, so Safaricom refuses a
+  non-matching account number at the customer's phone.
+- Customer self-verify now queues the payment for staff approval by default
+  (new *Customer Self-Verify* setting: queue / apply).
+- Guard: an amount that converts to less than 0.01 is never passed to
+  WHMCS's `addInvoicePayment()`, where 0 means "pay the full balance".
+- New *Accept Bare Invoice Number* setting.
+
+### Native WHMCS integration
+- `flexpay_config_validate`: settings are validated on save (shortcodes,
+  prefix length, proxy CIDRs, credential encryption, and Callback Security
+  "off" refused in live mode).
+- `flexpay_account_balance` (WHMCS 8.2+): M-Pesa balance in WHMCS's native
+  gateway balances.
+- `flexpay_TransactionInformation` (WHMCS 8.2+): transaction details modal
+  under Billing → Transactions.
+- `paymentReversed()` records successful M-Pesa reversals on the invoice.
+- `EmailPreSend` / `EmailTplMergeFields`: M-Pesa payment-instruction merge
+  fields for invoice emails.
+- `AdminInvoicesControlsOutput`: M-Pesa panel on the admin invoice page,
+  with a Send M-Pesa Prompt button.
+- Reconciliation: *Credit to client* records an unmatched payment as account
+  credit via WHMCS `AddTransaction`.
+- `logModuleCall`: Daraja calls appear in the WHMCS Module Log, with
+  credentials redacted.
+- Widget and email copy tell customers to use the account number exactly,
+  and explain that Till payments are confirmed by staff.
+
+
 ## v3.5.0 — Security hardening, reliability fixes, new Daraja features
 
 ### Critical security fixes

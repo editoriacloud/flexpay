@@ -31,6 +31,48 @@ and reversals — all without touching the WHMCS API or shell.
 3. **Admin Homepage Widget** — a live 7-day stats card on the WHMCS admin
    dashboard homepage, with a link straight into the full Dashboard.
 
+4. **Native WHMCS integration**
+   - Invoice emails: `{$flexpay_instructions}`, `{$flexpay_paybill}`,
+     `{$flexpay_account}` and `{$flexpay_amount_kes}` merge fields (listed in
+     the invoice template editor), so customers get the exact account number
+     before they pay.
+   - Admin invoice page: an M-Pesa panel with the invoice's M-Pesa payments,
+     unmatched payments that may belong to it, and a **Send M-Pesa Prompt**
+     button.
+   - Settings are validated when you save the gateway (`_config_validate`).
+   - WHMCS 8.2+: M-Pesa balance in WHMCS's gateway balances
+     (`_account_balance`), and transaction details when you click a FlexPay
+     transaction ID under Billing → Transactions (`_TransactionInformation`).
+   - Reversals are recorded natively with WHMCS `paymentReversed()`.
+   - Every Daraja call appears in Utilities → Logs → Module Log when module
+     debugging is on (credentials redacted).
+
+## Payment matching rules (v3.6.0+)
+
+A payment is applied to an invoice **automatically only when its account
+reference is exactly one open invoice**. Accepted forms of the reference:
+
+| Customer typed | Result |
+|---|---|
+| `INV-42`, `inv42`, `INV 0042`, `#42` | Invoice 42 |
+| `42`, `0042` | Invoice 42 (switch off with *Accept Bare Invoice Number*) |
+| `2026-0077` (the WHMCS invoice number, with custom/sequential numbering) | That invoice |
+| `INV-42-A`, `INV 23 and 24`, `PAY INV42`, a name, a phone number | **Unmatched** |
+| nothing (Till / Buy Goods) | **Unmatched** |
+| a reference that is one invoice's ID and another's invoice number | **Unmatched** (ambiguous) |
+| a reference to a Paid / Cancelled invoice | **Unmatched** |
+
+The amount and the payer's phone **never** cause a payment to be applied.
+They only pre-fill a *suggestion* in the Reconciliation tab, where you can
+apply the payment to an invoice, credit it to the client's account
+balance, or dismiss it. STK payments carry FlexPay's own `INV-42`
+reference, so they credit their invoice, but only while it is still open.
+Customer self-verification queues payments for staff approval by default.
+
+With *C2B Validation Mode* = strict (and external validation enabled on
+your shortcode by Safaricom), payments whose account number would not
+match are refused at the customer's phone, before any money moves.
+
 ## Why "intelligent" C2B?
 
 Most M-Pesa WHMCS integrations require you to manually call Safaricom's
@@ -75,7 +117,10 @@ FlexPay moves money, so every entry point is authenticated:
   report the same payment. Database-level locking means it is applied once.
 - **Customer self-verify** accepts M-Pesa receipt numbers only (the value
   only the payer has), is locked to the invoice, and is rate-limited per
-  invoice and per IP.
+  invoice and per IP. By default it only flags the payment for staff approval.
+- **Rigid matching**: see *Payment matching rules* above. A tiny payment on a
+  non-KES invoice that would round to 0.00 is never passed to WHMCS, because
+  `addInvoicePayment(0)` means "pay the full balance".
 - **Admin dashboard**: CSRF-protected actions, enforced role list, secrets
   redacted from the API log, OAuth tokens cached encrypted in the database
   (not in the shared `/tmp`).
@@ -176,7 +221,7 @@ FP_TEST_MYSQL=fp_e2e php run.php             # MySQL/MariaDB (user fp/fp on 127.
 FP_TEST_MYSQL=fp_migration php migration.php # upgrade a real v3.4.0 schema
 ```
 
-## Customer self-verification (v3.1.0+)
+## Customer self-verification (v3.1.0+, queue mode v3.6.0+)
 
 Every invoice rendered by the FlexPay gateway now includes an
 "Already paid? Verify your payment" box, below the manual payment
@@ -187,9 +232,11 @@ This is intentionally receipt-only, invoice-locked and rate-limited (see
 `modules/gateways/flexpay/verify.php` and
 `FlexPayStore::verifyPaymentForInvoice()` for the exact security model).
 If the receipt isn't on file yet, FlexPay asks Safaricom (Transaction
-Status Query). A confirmed payment from the client's own phone is applied
-automatically. One from another phone is queued in Reconciliation with the
-invoice pre-filled, for one-click approval.
+Status Query). By default (*Customer Self-Verify* = queue) a found payment
+is **not** applied by the customer. It is queued in Reconciliation with
+their invoice pre-filled, for one-click staff approval. In "apply" mode it
+is applied immediately (for Safaricom-confirmed receipts, only when the
+paying phone matches the client).
 If you ever need to clear a stuck rate limit for a customer who's made
 several genuine retries, use **Tools → Reset Customer Verify Limit** in
 the FlexPay Dashboard addon.
@@ -211,13 +258,13 @@ stay Unpaid/Overdue with a reduced balance) are now visible everywhere:
 the customer sees "KES X still due" immediately after paying, and the
 Transactions tab shows a PARTIAL badge at a glance.
 
-For Till (Buy Goods) payments, which carry no account reference, FlexPay
-matches the **payer's phone** (including the SHA-256-hashed MSISDN that
-C2B v2 sends) against clients with exactly one open invoice for that
-amount. Matching by amount alone is available but off by default, because
-it can credit the wrong customer. A partial payment is never auto-applied.
-The Reconciliation tab flags it with "Possible partial payment toward: #X
-(balance KES Y, same phone)" and pre-fills the likeliest invoice.
+Till (Buy Goods) payments carry no account reference, so under the v3.6
+matching rules they always go to Reconciliation unless they were made
+through the invoice page's STK prompt (which carries the reference). The
+Reconciliation tab suggests the likeliest invoice from the payer's phone
+(including the SHA-256-hashed MSISDN that C2B v2 sends) and the amount,
+and flags "Possible partial payment toward: #X (balance KES Y, same
+phone)". You confirm it with one click.
 
 ## Licensing (v3.4.0+)
 
